@@ -1,0 +1,549 @@
+/* ── Toast ── */
+.toast-wrap {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+}
+
+.toast-msg {
+    background: var(--secondary-color-1);
+    color: #fff;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: .85rem;
+    font-weight: 600;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .25);
+    display: none;
+}
+
+.toast-msg.show {
+    display: block;
+    animation: fadeInUp .3s ease, fadeOut .4s ease 2.4s forwards;
+}
+
+.toast-msg.error {
+    background: #c0392b;
+}
+
+@keyframes fadeInUp {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes fadeOut {
+    to {
+        opacity: 0;
+    }
+}
+
+/* ── Profile sidebar layout ── */
+.profile-layout {
+    display: flex;
+    min-height: 450px;
+}
+
+.profile-content-area {
+    flex: 1;
+    padding: 2rem 2.5rem;
+    overflow-y: auto;
+    background: #fff;
+    border-radius: 0 5px 5px 0;
+}
+
+.profile-sidebar {
+    width: 220px;
+    flex-shrink: 0;
+    background: #f8f9fa;
+    border-right: 1.5px solid #e8e8e8;
+    border-radius: 5px 0 0 5px !important;
+    padding: 1.5rem 0;
+}
+
+.profile-sidebar .sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.85rem 1.5rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #555;
+    transition: all 0.2s ease;
+    border-left: 3px solid transparent;
+}
+
+.profile-sidebar .sidebar-item:hover {
+    background: #e9ecef;
+    color: #333;
+}
+
+.profile-sidebar .sidebar-item.active {
+    background: #fff;
+    color: var(--secondary-color-1);
+    border-left-color: var(--secondary-color-1);
+    background: var(--accent-yellow);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+    font-weight: 600;
+}
+
+.profile-sidebar .sidebar-item i {
+    font-size: 1.1rem;
+    width: 1.5rem;
+    text-align: center;
+}
+
+.section-content {
+    display: none;
+}
+
+.section-content.active {
+    display: block;
+}
+
+.section-content .profile-header {
+    border-bottom: none;
+    padding: 0 0 1rem 0;
+}
+
+.section-content hr {
+    margin: 0 0 1.5rem 0;
+    border-color: #eee;
+}
+
+/* ── Header ── */
+.profile-header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: 2rem 2.5rem;
+    border-bottom: 1.5px solid #eee;
+    margin-bottom: 0;
+}
+
+.profile-avatar {
+    width: 140px !important;
+    height: 140px !important;
+    border-radius: 50%;
+    background: #d9d6d6 !important;
+    color: var(--secondary-color-1) !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    font-size: 56px !important;
+    font-weight: 700;
+    flex-shrink: 0;
+    border-radius: 50%;
+}
+
+.profile-user h2 {
+    color: var(--secondary-color-1);
+    margin-bottom: .2rem;
+    font-size: 1.5rem;
+}
+
+.profile-user p {
+    color: #666;
+    font-size: .95rem;
+}
+
+/* ── Content ── */
+.profile-content {
+    padding: 2rem 2.5rem;
+}
+
+/* ── Info cards ── */
+.info-card {
+    background: #fff !important;
+    border: 1.5px solid #e8e8e8 !important;
+    border-radius: 14px !important;
+    padding: 1.5rem !important;
+    height: 100%;
+}
+
+.info-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1.2rem !important;
+}
+
+.info-card-header h3 {
+    font-size: 1rem !important;
+    color: var(--secondary-color-1);
+}
+
+.info-field {
+    margin-bottom: 1rem;
+}
+
+.info-field .label {
+    display: block;
+    font-size: .8rem !important;
+    font-weight: 500;
+    color: #888 !important;
+    margin-bottom: .35rem !important;
+}
+
+.field-value {
+    background: #f0f0f0 !important;
+    padding: 10px 12px !important;
+    border-radius: 6px !important;
+    color: #333 !important;
+    font-size: .92rem !important;
+    border: none !important;
+}
+
+.info-action-btn {
+    padding: 10px 20px !important;
+    width: auto !important;
+    border-radius: 8px !important;
+    background-color: white !important;
+    color: var(--secondary-color-1) !important;
+    border: 2px solid #d0d0d0 !important;
+    font-weight: 400;
+    font-size: 14px;
+    line-height: 1.5;
+    transition: all 0.3s ease;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    white-space: nowrap;
+    height: 42px;
+    cursor: pointer;
+}
+
+.info-action-btn:hover {
+    background-color: var(--secondary-color-1) !important;
+    border-color: #8235bc !important;
+    color: white !important;
+}
+
+
+
+
+/* ── Password strength bar ── */
+.strength-bar-wrap {
+    height: 4px;
+    background: #eee;
+    border-radius: 2px;
+    margin-top: 6px;
+    overflow: hidden;
+}
+
+.strength-bar {
+    height: 100%;
+    width: 0%;
+    border-radius: 2px;
+    transition: width .3s, background .3s;
+}
+
+.strength-label {
+    font-size: 11px;
+    color: #888;
+    margin-top: 3px;
+}
+
+/* ── System Flush Styles ──────────────────────────────────────────────────── */
+.flush-confirm-card {
+    background: #f8d7da;
+    border: 2px solid #dc3545;
+    border-radius: 12px;
+    padding: 1.25rem;
+    margin-bottom: 1.25rem;
+}
+
+.flush-status-card {
+    background: #fff;
+    border: 1.5px solid #e8e8e8;
+    border-radius: 14px;
+    padding: 1.5rem;
+}
+
+.flush-status-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
+}
+
+.flush-badge {
+    font-size: 11px;
+    padding: 0.3rem 0.75rem;
+    border-radius: 9999px;
+    font-weight: 600;
+}
+
+.flush-badge.confirmed {
+    background: #d1e7dd;
+    color: #0f5132;
+}
+
+.flush-badge.pending {
+    background: #fff3cd;
+    color: #856404;
+}
+
+.flush-countdown {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.25rem;
+    padding: 1rem;
+    background: #f8f9fa;
+    border-radius: 10px;
+}
+
+.countdown-item {
+    flex: 1;
+    min-width: 140px;
+}
+
+.countdown-label {
+    display: block;
+    font-size: 0.75rem;
+    color: #888;
+    font-weight: 500;
+    margin-bottom: 0.2rem;
+}
+
+.countdown-value {
+    font-size: 1rem;
+    font-weight: 600;
+    color: #333;
+}
+
+.flush-items-list {
+    margin-bottom: 0.5rem;
+}
+
+.flush-items-list h5 {
+    font-size: 0.9rem;
+    color: #555;
+}
+
+.flush-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0;
+    font-size: 0.85rem;
+    color: #555;
+}
+
+.flush-item.checked {
+    color: #0f5132;
+}
+
+.flush-item.checked i {
+    color: var(--secondary-color-1);
+    font-size: 1rem;
+}
+
+.flush-item.unchcked i {
+    color: #adb5bd;
+    font-size: 1rem;
+}
+
+.flush-setup-card {
+    background: #fff;
+    border: 1.5px solid #e8e8e8;
+    border-radius: 14px;
+    padding: 1.5rem;
+}
+
+.flush-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.flush-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.85rem 1rem;
+    border: 1.5px solid #e8e8e8;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+}
+
+.flush-option:hover {
+    border-color: #c8c8c8;
+    background: #fafafa;
+}
+
+.flush-option.disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+    background: #f5f5f5;
+}
+
+.flush-option.cascaded {
+    border-color: #86b7fe;
+    background: #f0f7ff;
+}
+
+.flush-option input[type="checkbox"] {
+    margin-top: 0.15rem;
+    width: 1.1rem;
+    height: 1.1rem;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.flush-option.disabled input[type="checkbox"] {
+    cursor: not-allowed;
+}
+
+.flush-option-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+
+.flush-option-title {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #333;
+}
+
+.flush-option-desc {
+    font-size: 0.78rem;
+    color: #888;
+}
+
+.flush-datetime-row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.flush-datetime-field {
+    flex: 1;
+    min-width: 200px;
+}
+
+.flush-datetime-field .form-label {
+    font-size: 0.85rem;
+    color: #555;
+}
+
+.flush-datetime-field small {
+    display: block;
+    margin-top: 0.25rem;
+}
+
+/* ── Extension sub-form ───────────────────────────────────────────────────── */
+.flush-ext-subform {
+    padding: 0.75rem 1rem 0.75rem 2.6rem;
+    display: block;
+}
+
+.flush-ext-form-inner {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    align-items: flex-end;
+}
+
+.flush-ext-field {
+    flex: 1;
+    min-width: 160px;
+}
+
+.flush-ext-field .form-label {
+    font-size: 0.8rem;
+    color: #555;
+    margin-bottom: 0.25rem;
+}
+
+.flush-ext-field .form-control {
+    font-size: 0.85rem;
+}
+
+.flush-ext-subform small {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.75rem;
+}
+
+/* ── Hover info panels ──────────────────────────────────────────────────── */
+.hover-info-trigger {
+    position: relative;
+    cursor: pointer;
+    color: #6c757d;
+    font-size: 1.1rem;
+}
+
+.hover-info-trigger:hover .hover-info-panel {
+    display: block;
+}
+
+.hover-info-panel {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 1000;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    padding: 12px 16px;
+    min-width: 280px;
+    font-size: 0.82rem;
+    color: #333;
+    line-height: 1.5;
+    margin-top: 6px;
+    white-space: normal;
+}
+
+/* ── Forced Password Change ─────────────────────────────────────────────── */
+.forced-pw-change-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 60vh;
+    padding: 2rem;
+}
+
+.forced-pw-change-card {
+    background: #fff;
+    border: 2px solid #e8e8e8;
+    border-radius: 16px;
+    padding: 2.5rem;
+    max-width: 480px;
+    width: 100%;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+}
+
+.forced-pw-change-header {
+    text-align: center;
+    margin-bottom: 0.5rem;
+}
+
+.forced-pw-change-header i {
+    font-size: 2.5rem;
+    color: var(--secondary-color-1);
+    margin-bottom: 0.75rem;
+}
+
+.forced-pw-change-header h2 {
+    color: var(--secondary-color-1);
+    font-size: 1.35rem;
+}
+
+.forced-pw-change-header p {
+    font-size: 0.85rem;
+    line-height: 1.5;
+}

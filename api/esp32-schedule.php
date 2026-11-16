@@ -1,0 +1,38 @@
+<?php
+require_once __DIR__ . "/../src/Config/db_connect.php";
+header('Content-Type: text/plain');
+
+$token = $_GET['token'] ?? '';
+if ($token !== ESP32_TOKEN) {
+    http_response_code(401); exit;
+}
+
+date_default_timezone_set('Asia/Manila');   // â† ADD THIS LINE
+
+$cid = (int)($_GET['classroom_id'] ?? 1);
+$day = date('l');   // now correctly returns e.g. "Tuesday" in PST
+
+$stmt = $conn->prepare("
+    SELECT start_time, COALESCE(extended_until, end_time) AS end_time
+    FROM schedules
+    WHERE classroom_id = ? AND day_of_week = ?
+    ORDER BY start_time
+");
+$stmt->bind_param('is', $cid, $day);
+$stmt->execute();
+$res = $stmt->get_result();
+
+$slots = [];
+while ($row = $res->fetch_assoc()) {
+    $slots[] = date('H:i', strtotime($row['start_time'])) 
+             . '-' 
+             . date('H:i', strtotime($row['end_time']));
+}
+$stmt->close();
+
+echo implode(',', $slots);
+
+// The device now holds today's fresh list, so the dirty flag can be cleared.
+// (Cleared here — not in esp32-schedule-flag.php — so a flag consumed by a
+// poll is never lost when this fetch fails halfway on flaky WiFi.)
+$conn->query("UPDATE classrooms SET schedule_dirty = 0 WHERE id = $cid");

@@ -1,0 +1,157 @@
+<?php
+// api/faculty-status.php
+// GET ?classroom_id=X  â†’  live dashboard snapshot for faculty home
+// Called every 3 s by the JavaScript poll loop.
+
+require_once __DIR__ . "/../src/Config/db_connect.php";
+date_default_timezone_set('Asia/Manila');
+header('Content-Type: application/json');
+header('Cache-Control: no-store');
+
+if (empty($_SESSION['faculty_logged_in'])) {
+    http_response_code(401);
+    echo json_encode(['success' => false, 'message' => 'Unauthorized.']); exit;
+}
+session_write_close(); // release session lock - this endpoint is read-only
+
+$cid = (int)($_GET['classroom_id'] ?? 0);
+if (!$cid) {
+    http_response_code(400);
+    echo json_encode(['success' => false, 'message' => 'classroom_id required.']); exit;
+}
+
+$now_time = date('H:i:s');
+$now_day  = date('l');
+
+// - Classroom row -------------------------------
+$stmt = $conn->prepare("SELECT light_status, row1_status, row2_status, row3_status, pir_occupied, pir_since FROM classrooms WHERE id=? LIMIT 1");
+$stmt->bind_param('i', $cid);
+$stmt->execute();
+$stmt->bind_result($light_status, $row1_status, $row2_status, $row3_status, $pir_occupied, $pir_since);
+$stmt->fetch();
+$stmt->close();
+
+// - Active schedule ------------------------------
+$active_schedule = null;
+$stmt = $conn->prepare("
+    SELECT id, start_time, end_time, extended_until
+    FROM schedules
+    WHERE classroom_id = ?
+      AND day_of_week  = ?
+      AND start_time  <= ?
+      AND (extended_until >= ? OR (extended_until IS NULL AND end_time >= ?))
+    ORDER BY start_time
+    LIMIT 1
+");
+$stmt->bind_param('issss', $cid, $now_day, $now_time, $now_time, $now_time);
+$stmt->execute();
+$r = $stmt->get_result();
+if ($row = $r->fetch_assoc()) $active_schedule = $row;
+$stmt->close();
+
+// - Recent activity logs (last 7) -----------------------
+$logs = [];
+$stmt = $conn->prepare("
+    SELECT l.event_type, l.triggered_by, l.event_time, c.room_name
+    FROM lighting_logs l
+    JOIN classrooms c ON c.id = l.classroom_id
+    WHERE l.classroom_id = ?
+    ORDER BY l.event_time DESC
+    LIMIT 7
+");
+$stmt->bind_param('i', $cid);
+$stmt->execute();
+$r = $stmt->get_result();
+while ($row = $r->fetch_assoc()) $logs[] = $row;
+$stmt->close();
+
+// - Merge in dedicated PIR logs -----------------------
+$pir_logs = [];
+$stmt = $conn->prepare("
+    SELECT state, created_at
+    FROM pir_logs
+    WHERE classroom_id = ?
+    ORDER BY created_at DESC
+    LIMIT 7
+");
+$stmt->bind_param('i', $cid);
+$stmt->execute();
+$r = $stmt->get_result();
+while ($row = $r->fetch_assoc()) {
+    $pir_logs[] = [
+        'event_type'   => $row['state'] ? 'pir_motion' : 'pir_stopped',
+        'triggered_by' => 'PIR',
+        'event_time'   => $row['created_at'],
+        'room_name'    => null,
+    ];
+}
+$stmt->close();
+
+// Merge PIR logs into main logs array, sorted newest-first
+$logs = array_merge($logs, $pir_logs);
+usort($logs, fn($a, $b) => strtotime($b['event_time']) - strtotime($a['event_time']));
+$logs = array_slice($logs, 0, 10);
+
+// - Gesture logs (this faculty only, last 20) -----------------
+$faculty_id = (int)$_SESSION['faculty_id'];
+$gesture_logs = [];
+$stmt = $conn->prepare("
+    SELECT l.event_type, l.triggered_by, l.event_time, c.room_name
+    FROM lighting_logs l
+    JOIN classrooms c ON c.id = l.classroom_id
+    WHERE l.faculty_id = ?
+      AND l.classroom_id = ?
+      AND l.triggered_by = 'gesture'
+    ORDER BY l.event_time DESC
+    LIMIT 20
+");
+$stmt->bind_param('ii', $faculty_id, $cid);
+$stmt->execute();
+$r = $stmt->get_result();
+while ($row = $r->fetch_assoc()) $gesture_logs[] = $row;
+$stmt->close();
+
+// - Faculty permissions for lock computation -----------------
+$perm_stmt = $conn->prepare("SELECT lighting_control, gesture_control FROM faculty_permissions WHERE faculty_id = ? LIMIT 1");
+$perm_stmt->bind_param('i', $faculty_id);
+$perm_stmt->execute();
+$perm_row = $perm_stmt->get_result()->fetch_assoc();
+$perm_stmt->close();
+$has_lighting_perm = $perm_row ? (bool)$perm_row['lighting_control'] : true;
+$has_gesture_perm  = $perm_row ? (bool)$perm_row['gesture_control']  : true;
+
+// - Lock logic (mirrors get_overlay_reason in faculty-home.php) --
+$has_schedule = $active_schedule !== null;
+$lock_lighting = !$has_schedule || !$has_lighting_perm;
+$lock_gesture  = !$has_schedule || !$has_gesture_perm;
+
+$lock_message = null;
+if (!$has_schedule) {
+    $lock_message = 'No active schedule. Light and gesture controls are locked.';
+} elseif ($lock_lighting && $lock_gesture) {
+    $lock_message = 'Your account does not have access to light or gesture controls.';
+} elseif ($lock_lighting) {
+    $lock_message = 'Your account does not have access to light controls.';
+} elseif ($lock_gesture) {
+    $lock_message = 'Your account does not have access to gesture controls.';
+}
+
+echo json_encode([
+    'success'         => true,
+    'server_time'     => $now_time,
+    'light_status'    => $light_status ?? 'off',
+    'row1_status'     => $row1_status ?? 'off',
+    'row2_status'     => $row2_status ?? 'off',
+    'row3_status'     => $row3_status ?? 'off',
+    'pir_occupied'    => (bool)$pir_occupied,
+    'pir_since'       => $pir_since,
+    'schedule_active' => $has_schedule,
+    'schedule_end'    => $active_schedule
+                            ? ($active_schedule['extended_until'] ?? $active_schedule['end_time'])
+                            : null,
+    'lock_gesture'    => $lock_gesture,
+    'lock_lighting'   => $lock_lighting,
+    'message'         => $lock_message,
+    'logs'            => $logs,
+    'gesture_logs'    => $gesture_logs,
+]);

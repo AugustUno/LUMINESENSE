@@ -1,0 +1,990 @@
+// initialize-gesture.js
+// Handles camera enable/disable, canvas skeleton overlays, and real-time client-side gesture → lighting control.
+
+import { GestureRecognizer, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/vision_bundle.mjs";
+
+// ── Element refs ──────────────────────────────────────────────────────────────
+const enableBtn = document.getElementById('enableCameraBtn');
+const disableBtn = document.getElementById('disableCameraBtn');
+const webcamVideo = document.getElementById('webcamVideo');
+const webcamCanvas = document.getElementById('webcamCanvas');
+const gestureResult = document.getElementById('gestureResult');
+const accuracyBar = document.getElementById('accuracyBar');
+const loadingOverlay = document.getElementById('gestureLoadingOverlay');
+
+let recognizer = null;
+let stream = null;
+let active = false;
+let lastVideoTime = -1;
+let _startToken = 0;
+let _pipelineReady = false; // true once video is live AND first inference ran
+let _videoListenersAttached = false;
+
+// ── Loading-overlay stage label ─────────────────────────────────────────────
+function setLoadingLabel(text) {
+    const el = document.getElementById('gestureLoadingLabel');
+    if (el) el.textContent = text;
+}
+
+// ── Promise timeout so a hung stage fails loudly instead of spinning forever
+function withTimeout(promise, ms, label) {
+    let timer = null;
+    const timeout = new Promise(function (_, reject) {
+        timer = setTimeout(function () { reject(new Error(label + ' timed out')); }, ms);
+    });
+    return Promise.race([promise, timeout]).finally(function () {
+        if (timer) clearTimeout(timer);
+    });
+}
+
+// ── Chroma Key & Enhancement toggles ──────────────────────────────────────────
+let chromaKeyEnabled = true;
+let enhanceEnabled = true;
+const procCanvas = document.createElement('canvas');
+const procCtx = procCanvas.getContext('2d');
+
+// ── Progress bar colour map ────────────────────────────────────────────────────
+const PROGRESS_CLASSES = ['bg-success', 'bg-primary', 'bg-danger', 'bg-info', 'bg-warning', 'bg-dark', 'bg-secondary'];
+const GESTURE_COLOUR = {
+    Open_Palm: 'bg-success',
+    Thumb_Up: 'bg-primary',
+    Closed_Fist: 'bg-danger',
+    Pointing_Up: 'bg-info',
+    Victory: 'bg-warning',
+    ILoveYou: 'bg-dark',
+};
+
+// ── Initialize MediaPipe Gesture Recognizer ───────────────────────────────────
+// quiet=true for background preload: no button side effects (the button stays
+// clickable; a failed preload simply retries on the next explicit start).
+async function initializeRecognizer(quiet) {
+    if (recognizer) return;
+    if (!quiet && enableBtn) {
+        enableBtn.disabled = true;
+        enableBtn.textContent = 'Loading AI Model…';
+    }
+    const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+    );
+    // Initialize recognizer with options, explicitly enabling video running mode!
+    const modelPath = "../../models/gesture_recognizer.task";
+    try {
+        recognizer = await GestureRecognizer.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath: modelPath,
+                delegate: "GPU"
+            },
+            runningMode: "VIDEO"
+        });
+    } catch (e) {
+        // GPU/WebGL unavailable or too slow — fall back to CPU instead of
+        // failing the whole camera start.
+        console.warn('Gesture GPU delegate failed, falling back to CPU:', e);
+        recognizer = await GestureRecognizer.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath: modelPath,
+                delegate: "CPU"
+            },
+            runningMode: "VIDEO"
+        });
+    }
+}
+
+function setProgressStyle(gesture, confidence) {
+    if (!accuracyBar) return;
+    accuracyBar.classList.remove(...PROGRESS_CLASSES);
+    accuracyBar.classList.add(GESTURE_COLOUR[gesture] || 'bg-secondary');
+    const w = Math.max(0, Math.min(100, Math.round(confidence)));
+    accuracyBar.style.width = `${w}%`;
+    accuracyBar.textContent = `${w}%`;
+    accuracyBar.setAttribute('aria-valuenow', String(w));
+}
+
+// ── Gesture → Stackable Command Queue with 👍 Confirmation & Two-Hand Input ──
+const DEBOUNCE_MS = 400;
+const CONFIRM_TIMEOUT_MS = 15000;
+const GESTURE_ACCURACY_THRESHOLD = 70; // was 80
+const GESTURE_DECAY_THRESHOLD = 60;    // was 70
+const DROPOUT_TOLERANCE_MS = 350;       // Allow 350ms of flicker/dropout before resetting timer
+const GESTURE_GAP_MS = 2000;            // 2s minimum gap before the same gesture can register again
+const ROW_GESTURE = { Pointing_Up: 1, Victory: 2, ILoveYou: 3 };
+const MAX_STACK_SIZE = 4;               // Max queued commands before confirmation
+const HAND_STALE_MS = 1500;             // Forget a hand after this long without detection
+
+// Per-hand state machines so both hands can queue commands independently.
+const handStates = new Map();
+let _stackId = 0;
+
+// Stacked (queued) commands, executed in FIFO order on the final 👍 confirmation.
+let pendingStack = [];  // [{ id, gesture, action, label, row }]
+let pendingTimeout = null;
+let _lastStackFeedbackAt = 0; // Tracks when the last transient queue message was shown
+
+function getHandState(key) {
+    let st = handStates.get(key);
+    if (!st) {
+        st = { lastGesture: 'No Gesture', heldSince: null, actioned: false, dropoutStart: null, lastSeen: Date.now() };
+        handStates.set(key, st);
+    }
+    return st;
+}
+
+// Last time each gesture type registered an action (keyed by gesture name), so a
+// 2s gap is enforced globally — not per hand. This blocks double-fires from a
+// single flickery detection (dropout re-hold, or the handedness label flipping
+// Left↔Right for the same physical hand) while still allowing two DIFFERENT
+// gestures from two hands to queue simultaneously.
+const lastGestureActionAt = new Map();
+
+function showStackFeedback(html) {
+    if (!gestureResult) return;
+    gestureResult.innerHTML = html;
+    _lastStackFeedbackAt = Date.now();
+}
+
+// Smoothed prediction to filter frame-by-frame noise (hysteresis + EMA filter)
+let _lastGestureRaw = 'No Gesture';
+let _smoothedConfidence = 0;
+
+// Last-known authoritative row states from the server (refreshed on every
+// successful fetchServerRowStates call). Used as the toggle baseline so a
+// gesture flips the REAL state instead of the (up to 3s stale) DOM switches.
+let _serverRowStates = null;
+
+function updatePillsState() {
+    const pendingRows = new Set();
+    let allAffected = false;
+
+    for (const it of pendingStack) {
+        if (it.action === 'all_on' || it.action === 'all_off') allAffected = true;
+        else if (it.action === 'set_row') pendingRows.add(it.row);
+    }
+
+    [1, 2, 3].forEach(r => {
+        const p = document.getElementById(`rowPill${r}`);
+        if (!p) return;
+        p.classList.remove('pending', 'confirmed');
+
+        if (allAffected || pendingRows.has(r)) {
+            p.classList.add('pending');
+        }
+    });
+    if (typeof window.syncRowPills === 'function') window.syncRowPills();
+}
+
+function flashPill(row) {
+    const p = document.getElementById(`rowPill${row}`);
+    if (!p) return;
+    p.classList.remove('active', 'pending');
+    p.classList.add('confirmed');
+    setTimeout(() => {
+        p.classList.remove('confirmed');
+        updatePillsState();
+    }, 1200);
+}
+
+function flashAllPills() {
+    [1, 2, 3].forEach(r => {
+        const p = document.getElementById(`rowPill${r}`);
+        if (p) {
+            p.classList.remove('active', 'pending');
+            p.classList.add('confirmed');
+        }
+    });
+    setTimeout(() => {
+        [1, 2, 3].forEach(r => {
+            const p = document.getElementById(`rowPill${r}`);
+            if (p) p.classList.remove('confirmed');
+        });
+        updatePillsState();
+    }, 1200);
+}
+
+function pushAction(gesture, action, label, row, state) {
+    pendingStack.push({ id: ++_stackId, gesture, action, label, row, state });
+    updatePillsState();
+    renderStackQueue();
+    startPendingTimeout();
+}
+
+function renderStackQueue() {
+    const q = document.getElementById('pendingStackQueue');
+    const wrap = document.getElementById('stackQueueWrap');
+    const count = document.getElementById('stackQueueCount');
+
+    if (!q) return;
+
+    if (pendingStack.length === 0) {
+        q.innerHTML = '';
+        if (wrap) wrap.style.display = 'none';
+        if (count) count.textContent = `0/${MAX_STACK_SIZE}`;
+        return;
+    }
+
+    if (wrap) wrap.style.display = '';
+    if (count) count.textContent = `${pendingStack.length}/${MAX_STACK_SIZE}`;
+
+    const chipClass = it => {
+        if (it.action === 'all_on') return 'chip-on';
+        if (it.action === 'all_off') return 'chip-off';
+        return 'chip-row';
+    };
+
+    q.innerHTML = pendingStack.map((it, idx) => {
+        const cls = chipClass(it);
+        return `<span class="stack-chip ${cls}" title="${it.gesture.replace(/_/g, ' ')}"><span class="chip-index">${idx + 1}</span>${it.label}</span>`;
+    }).join('');
+}
+
+// Fetch the classroom's authoritative row states from the server. Returns null
+// on failure so callers can fall back to the (possibly stale) DOM switches.
+async function fetchServerRowStates() {
+    try {
+        if (typeof CLASSROOM_ID === 'undefined') return null;
+        const res = await fetch(`../../api/faculty-status.php?classroom_id=${CLASSROOM_ID}`);
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!data || !data.success) return null;
+        _serverRowStates = {
+            1: data.row1_status === 'on',
+            2: data.row2_status === 'on',
+            3: data.row3_status === 'on',
+        };
+        return _serverRowStates;
+    } catch (e) {
+        console.warn('fetchServerRowStates error:', e);
+        return null;
+    }
+}
+
+async function executePendingStack() {
+    if (!pendingStack.length) return;
+    if (window.__lightGridBusy && window.__lightGridBusy.isBusy()) return; // block while a toggle POST is in flight
+
+    const stack = pendingStack.slice();
+    pendingStack = [];
+    clearPendingTimeout();
+
+    const busy = window.__lightGridBusy;
+    if (busy) busy.begin();
+    try {
+    // Compute the baseline from the SERVER's authoritative state, not the DOM
+    // switches. The switches are only refreshed every ~3s by faculty-status.php
+    // (and stop refreshing if that poll fails), so toggling against them fires
+    // the OPPOSITE command whenever the DB changed through another path (PIR
+    // auto-on, cron auto-off, another tab). Fetch the truth at execution time;
+    // fall back to the DOM only if the fetch fails.
+    const getSwitch = r => {
+        const sw = document.getElementById(`row-${r}-switch`);
+        return sw ? sw.checked : false;
+    };
+    const serverState = await fetchServerRowStates();
+    let initial;
+    if (serverState) {
+        initial = serverState;
+        // Sync switches/bulbs to the server truth so the UI reflects reality
+        // and subsequent queue labels compute against it.
+        for (let r = 1; r <= 3; r++) {
+            const sw = document.getElementById(`row-${r}-switch`);
+            if (sw) sw.checked = serverState[r];
+            document.querySelectorAll(`.bulb-img[data-row="${r}"]`).forEach(img => {
+                img.src = serverState[r] ? '../../images/bulb-on.png' : '../../images/bulb-off.png';
+            });
+        }
+    } else if (_serverRowStates) {
+        // No fresh fetch (offline/timeout) — fall back to the last known
+        // authoritative server snapshot, which is still more accurate than the
+        // 3s-stale DOM switches.
+        initial = _serverRowStates;
+    } else {
+        initial = { 1: getSwitch(1), 2: getSwitch(2), 3: getSwitch(3) };
+    }
+    const final = { ...initial };
+
+    for (const it of stack) {
+        if (it.action === 'all_on') {
+            final[1] = final[2] = final[3] = true;
+        } else if (it.action === 'all_off') {
+            final[1] = final[2] = final[3] = false;
+        } else if (it.action === 'set_row') {
+            final[it.row] = it.state === 'on';
+        }
+    }
+
+    const overallOn = final[1] || final[2] || final[3];
+
+    // Keep the cached server snapshot in sync with what we just commanded, so
+    // the next gesture's toggle target computes against the REAL current state
+    // instead of the pre-command snapshot (which caused "shows ON, turns OFF").
+    _serverRowStates = final;
+
+    // Update UI switches, bulbs and badge to the final state
+    for (let r = 1; r <= 3; r++) {
+        const sw = document.getElementById(`row-${r}-switch`);
+        if (sw) sw.checked = final[r];
+        document.querySelectorAll(`.bulb-img[data-row="${r}"]`).forEach(img => {
+            img.src = final[r] ? '../../images/bulb-on.png' : '../../images/bulb-off.png';
+        });
+    }
+    _updateAllLightsBadge(overallOn);
+
+    // Visual flash for affected rows
+    const flashRows = new Set();
+    let flashAll = false;
+    for (const it of stack) {
+        if (it.action === 'set_row') flashRows.add(it.row);
+        else flashAll = true;
+    }
+    if (flashAll) {
+        flashAllPills();
+    } else {
+        flashRows.forEach(flashPill);
+    }
+
+    // Persist only the rows whose final state actually changed
+    const changedRows = [1, 2, 3].filter(r => initial[r] !== final[r]);
+    for (const r of changedRows) {
+        const form = new FormData();
+        if (typeof CLASSROOM_ID !== 'undefined') form.append('classroom_id', CLASSROOM_ID);
+        form.append('triggered_by', 'gesture');
+        form.append('row', String(r));
+        form.append('state', final[r] ? 'on' : 'off');
+        form.append('new_global_light_status', overallOn ? 'on' : 'off');
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        try {
+            await fetch('../../api/lights.php', { method: 'POST', body: form, signal: ctrl.signal });
+        } catch (e) {
+            console.warn('executePendingStack persist error:', e);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    if (typeof logGestureEvent === 'function') {
+        for (const command of stack) {
+            logGestureEvent('gesture', command.gesture);
+        }
+    }
+
+    renderStackQueue();
+    updatePillsState();
+    showStackFeedback(`<span class="text-success bold">✔ CONFIRMED: ${stack.length} command${stack.length > 1 ? 's' : ''} executed</span>`);
+    } finally {
+        if (busy) busy.end();
+    }
+}
+
+function clearPendingTimeout() {
+    if (pendingTimeout) {
+        clearTimeout(pendingTimeout);
+        pendingTimeout = null;
+    }
+}
+
+function startPendingTimeout() {
+    clearPendingTimeout();
+    pendingTimeout = setTimeout(() => {
+        if (pendingStack.length) {
+            const n = pendingStack.length;
+            showStackFeedback(`<span class="text-danger bold">✘ Cancelled: ${n} queued command${n > 1 ? 's' : ''} (Timed out)</span>`);
+            pendingStack = [];
+            updatePillsState();
+            renderStackQueue();
+        }
+    }, CONFIRM_TIMEOUT_MS);
+}
+
+function _updateAllLightsBadge(isOn) {
+    const badge = document.getElementById('allLightsStatus');
+    const btnCont = document.getElementById('allLightsContainer');
+    if (badge) { badge.textContent = isOn ? 'ON' : 'OFF'; badge.className = `bold ${isOn ? 'on' : 'off'}`; }
+    if (btnCont) { btnCont.className = btnCont.className.replace(/all-lights-(on|off)/, `all-lights-${isOn ? 'on' : 'off'}`); }
+    const sLight = document.getElementById('statusLighting');
+    if (sLight) { sLight.textContent = isOn ? 'ON' : 'OFF'; sLight.className = isOn ? 'text-success' : 'text-danger'; }
+}
+
+function processHand(handKey, gesture, confidence) {
+    const st = getHandState(handKey);
+    st.lastSeen = Date.now();
+
+    let activeGesture = gesture;
+
+    // Apply Schmitt trigger (hysteresis) to prevent flickering near the threshold
+    const threshold = (st.lastGesture && st.lastGesture !== 'No Gesture' && st.lastGesture === gesture)
+        ? GESTURE_DECAY_THRESHOLD
+        : GESTURE_ACCURACY_THRESHOLD;
+
+    if (confidence < threshold) {
+        activeGesture = 'No Gesture';
+    }
+
+    // Real-time console debugging to trace recognition and timer state per hand
+    if (gesture !== 'No Gesture') {
+        const heldTime = st.heldSince ? (Date.now() - st.heldSince) : 0;
+        console.log(`[MediaPipe Debug][${handKey}] Raw: "${gesture}" (${confidence.toFixed(1)}%), Active: "${activeGesture}", Last: "${st.lastGesture}", Held: ${heldTime}ms`);
+    }
+
+    // Handle gesture transitions with a dropout grace period
+    if (activeGesture !== st.lastGesture) {
+        if (activeGesture === 'No Gesture') {
+            // Start grace period for temporary dropouts
+            if (!st.dropoutStart) {
+                st.dropoutStart = Date.now();
+            }
+            // Only reset state if the dropout lasts longer than the tolerance window
+            if (Date.now() - st.dropoutStart >= DROPOUT_TOLERANCE_MS) {
+                st.lastGesture = 'No Gesture';
+                st.heldSince = Date.now();
+                st.actioned = false;
+                st.dropoutStart = null;
+            }
+        } else {
+            // Transitioned to a new valid gesture: reset hold state immediately
+            st.lastGesture = activeGesture;
+            st.heldSince = Date.now();
+            st.actioned = false;
+            st.dropoutStart = null;
+            return;
+        }
+    } else {
+        // Active gesture matches the last gesture: clear any active dropout timer
+        st.dropoutStart = null;
+    }
+
+    // Once held for DEBOUNCE_MS, this hand registers its command — but only if at
+    // least GESTURE_GAP_MS (2s) has passed since the same gesture last fired,
+    // so dropout flicker / handedness flips can't double-register a toggle
+    // (e.g. queue "Row 1 ON" then immediately "Row 1 OFF").
+    if (!st.actioned && st.lastGesture && st.lastGesture !== 'No Gesture' && (Date.now() - st.heldSince) >= DEBOUNCE_MS) {
+        st.actioned = true;
+        const lastFired = lastGestureActionAt.get(st.lastGesture) || 0;
+        if (Date.now() - lastFired >= GESTURE_GAP_MS) {
+            lastGestureActionAt.set(st.lastGesture, Date.now());
+            handleActionGesture(handKey, st.lastGesture);
+        }
+    }
+}
+
+function handleActionGesture(handKey, gesture) {
+    // 👍 from either hand confirms the whole stack
+    if (gesture === 'Thumb_Up') {
+        if (pendingStack.length) {
+            executePendingStack();
+        } else {
+            showStackFeedback(`<span class="text-info bold">No command queued to confirm!</span>`);
+        }
+        return;
+    }
+
+    // ✊ clears a non-empty stack; otherwise queues "all lights OFF"
+    if (gesture === 'Closed_Fist') {
+        if (pendingStack.length) {
+            const n = pendingStack.length;
+            pendingStack = [];
+            clearPendingTimeout();
+            updatePillsState();
+            renderStackQueue();
+            showStackFeedback(`<span class="text-danger bold">✘ Cleared ${n} queued command${n > 1 ? 's' : ''} (✊ Fist)</span>`);
+        } else {
+            pushAction('Closed_Fist', 'all_off', 'All Lights OFF', null);
+        }
+        return;
+    }
+
+    if (pendingStack.length >= MAX_STACK_SIZE) {
+        showStackFeedback(`<span class="text-warning bold">Stack full (${MAX_STACK_SIZE}/${MAX_STACK_SIZE}) — 👍 confirm or ✊ clear</span>`);
+        return;
+    }
+
+    if (gesture === 'Open_Palm') {
+        pushAction('Open_Palm', 'all_on', 'All Lights ON', null);
+        showStackFeedback(`<span class="text-confirm bold">📥 Queued: All Lights ON (${pendingStack.length}/${MAX_STACK_SIZE})</span>`);
+    } else if (ROW_GESTURE[gesture] !== undefined) {
+        const rowNum = ROW_GESTURE[gesture];
+        // Resolve the ABSOLUTE target now, against the authoritative lighting
+        // status (server truth + already-queued commands). Repeating a row
+        // gesture alternates its target (ON/OFF/ON/...), but the queued command
+        // is no longer a blind "toggle" — it's a definitive on/off. This keeps
+        // the bridge simple and accurate: it never flips the opposite way just
+        // because the DB changed between queue time and confirm time.
+        const effectiveState = simulateRowState(rowNum);
+        const targetState = effectiveState ? 'off' : 'on';
+        const targetStateLabel = targetState === 'on' ? 'ON' : 'OFF';
+        pushAction(gesture, 'set_row', `Row ${rowNum} ${targetStateLabel}`, rowNum, targetState);
+        showStackFeedback(`<span class="text-confirm bold">📥 Queued: Row ${rowNum} ${targetStateLabel} (${pendingStack.length}/${MAX_STACK_SIZE})</span>`);
+    }
+}
+
+// Simulates what a row's state will be after all currently queued commands run.
+// Baseline is the last-known server truth (cached on fetch), falling back to
+// the DOM switch so the queued target matches the real lighting status.
+function simulateRowState(row) {
+    const sw = document.getElementById(`row-${row}-switch`);
+    let state = _serverRowStates ? _serverRowStates[row] : (sw ? sw.checked : false);
+    for (const it of pendingStack) {
+        if (it.action === 'all_on') {
+            state = true;
+        } else if (it.action === 'all_off') {
+            state = false;
+        } else if (it.action === 'set_row' && it.row === row) {
+            state = it.state === 'on';
+        }
+    }
+    return state;
+}
+
+function updateGestureView(handDetections) {
+    // Best detection across all hands drives the progress bar & gesture image
+    let best = null;
+    for (const h of handDetections) {
+        if (!best || h.confidence > best.confidence) best = h;
+    }
+
+    const cleanGesture = best ? ((best.gesture && best.gesture !== 'None') ? best.gesture : 'No Gesture') : 'No Gesture';
+    const confidence = best ? best.confidence : 0;
+
+    // Apply low-pass filter (Exponential Moving Average) continuously to stabilize fluctuations
+    _smoothedConfidence = _smoothedConfidence * 0.65 + confidence * 0.35;
+    _lastGestureRaw = cleanGesture;
+
+    setProgressStyle(cleanGesture, _smoothedConfidence);
+
+    // Process each detected hand independently (two-hand input support)
+    if (handDetections.length > 0) {
+        for (const h of handDetections) {
+            processHand(h.key, h.gesture, h.confidence);
+        }
+    } else {
+        // No hands on screen: let per-hand dropout logic settle
+        for (const key of [...handStates.keys()]) {
+            processHand(key, 'No Gesture', 0);
+        }
+    }
+
+    // Forget hands that have not been seen for a while
+    const now = Date.now();
+    for (const [key, st] of handStates) {
+        if (now - st.lastSeen > HAND_STALE_MS) handStates.delete(key);
+    }
+
+    updateGestureImage(cleanGesture);
+
+    if (!pendingStack.length) {
+        if (gestureResult) {
+            if (cleanGesture === 'No Gesture' || _smoothedConfidence < 30) {
+                gestureResult.textContent = '—';
+            } else {
+                gestureResult.textContent = cleanGesture.replace(/_/g, ' ');
+            }
+        }
+    } else if (now - _lastStackFeedbackAt > 900) {
+        // Idle prompt while a stack is waiting for the final 👍
+        if (gestureResult) {
+            const n = pendingStack.length;
+            gestureResult.innerHTML = `<span class="text-confirm bold">👍 Confirm ${n} queued command${n > 1 ? 's' : ''}? (Hold 👍)</span>`;
+        }
+    }
+}
+
+// ── Gesture image map ─────────────────────────────────────────────────────────
+const GESTURE_IMAGES = {
+    Pointing_Up: '../../images/pointing-up.png',
+    Victory: '../../images/victory.png',
+    ILoveYou: '../../images/ily.png',
+    Open_Palm: '../../images/open-palm.png',
+    Closed_Fist: '../../images/closed-fist.png',
+    Thumb_Up: '../../images/thumbs-up.png',
+};
+
+function updateGestureImage(gesture) {
+    const list = document.getElementById('gestureImageList');
+    const img = document.getElementById('gestureImage');
+    const heading = document.getElementById('gestureListHeading');
+    if (!list || !img || !heading) return;
+
+    if (pendingStack.length) {
+        img.src = GESTURE_IMAGES.Thumb_Up;
+        img.style.display = '';
+        list.style.display = 'none';
+        heading.textContent = `Confirm Action (${pendingStack.length}/${MAX_STACK_SIZE})`;
+        return;
+    }
+
+    if (gesture && gesture !== 'No Gesture' && GESTURE_IMAGES[gesture]) {
+        img.src = GESTURE_IMAGES[gesture];
+        img.style.display = '';
+        list.style.display = 'none';
+        heading.textContent = 'Detected: ' + gesture.replace(/_/g, ' ');
+        return;
+    }
+
+    img.style.display = 'none';
+    list.style.display = '';
+    heading.textContent = 'Available Gestures';
+}
+
+// ── Convex Hull (Monotone Chain) ──────────────────────────────────────────────
+function cross(o, a, b) {
+    return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+function convexHull(points) {
+    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+    const lower = [];
+    for (const p of sorted) {
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+        lower.push(p);
+    }
+    const upper = [];
+    for (const p of sorted.reverse()) {
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+        upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+}
+
+// ── Update toggle button UI ───────────────────────────────────────────────────
+function updateToggleUI() {
+    const ct = document.getElementById('chromaKeyToggle');
+    if (ct) ct.classList.toggle('active', chromaKeyEnabled);
+    const et = document.getElementById('enhanceToggle');
+    if (et) et.classList.toggle('active', enhanceEnabled);
+}
+
+window.toggleChromaKey = function () {
+    chromaKeyEnabled = !chromaKeyEnabled;
+    updateToggleUI();
+};
+window.toggleEnhance = function () {
+    enhanceEnabled = !enhanceEnabled;
+    updateToggleUI();
+};
+
+// ── Draw skeleton landmarks with chroma-key spotlight overlay ─────────────────
+function drawLandmarks(landmarks) {
+    if (!webcamCanvas) return;
+    const ctx = webcamCanvas.getContext('2d');
+    ctx.clearRect(0, 0, webcamCanvas.width, webcamCanvas.height);
+
+    if (!landmarks || landmarks.length === 0) return;
+
+    const width = webcamCanvas.width;
+    const height = webcamCanvas.height;
+
+    // Skeletal connection joints map
+    const connections = [
+        [0, 1], [1, 2], [2, 3], [3, 4],      // Thumb
+        [0, 5], [5, 6], [6, 7], [7, 8],      // Index
+        [5, 9], [9, 10], [10, 11], [11, 12],  // Middle
+        [9, 13], [13, 14], [14, 15], [15, 16],// Ring
+        [13, 17], [0, 17], [17, 18], [18, 19], [19, 20] // Pinky
+    ];
+
+    // ── Chroma key spotlight effect ──
+    if (chromaKeyEnabled) {
+        // 1. Darken everything
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+        ctx.fillRect(0, 0, width, height);
+
+        // 2. Cut out hand silhouettes to reveal original video
+        ctx.save();
+        ctx.globalCompositeOperation = 'destination-out';
+        for (const hand of landmarks) {
+            const hull = convexHull(hand);
+            ctx.beginPath();
+            ctx.moveTo(hull[0].x * width, hull[0].y * height);
+            for (let i = 1; i < hull.length; i++) {
+                ctx.lineTo(hull[i].x * width, hull[i].y * height);
+            }
+            ctx.closePath();
+            ctx.fill();
+        }
+        ctx.restore();
+
+        // 3. Draw glowing cyan outline + subtle fill per hand
+        for (const hand of landmarks) {
+            const hull = convexHull(hand);
+            const pts = hull.map(p => ({ x: p.x * width, y: p.y * height }));
+
+            // Glowing outline
+            ctx.save();
+            ctx.shadowColor = 'rgba(0, 200, 255, 0.6)';
+            ctx.shadowBlur = 18;
+            ctx.strokeStyle = 'rgba(0, 200, 255, 0.5)';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) {
+                ctx.lineTo(pts[i].x, pts[i].y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+            ctx.restore();
+
+            // Subtle cyan tint inside hand
+            ctx.fillStyle = 'rgba(0, 200, 255, 0.06)';
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) {
+                ctx.lineTo(pts[i].x, pts[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+        }
+    }
+
+    // ── Skeleton + joints (always drawn) ──
+    for (const hand of landmarks) {
+        ctx.strokeStyle = '#2ecc71';
+        ctx.lineWidth = 3;
+        for (const [p1, p2] of connections) {
+            const pt1 = hand[p1];
+            const pt2 = hand[p2];
+            ctx.beginPath();
+            ctx.moveTo(pt1.x * width, pt1.y * height);
+            ctx.lineTo(pt2.x * width, pt2.y * height);
+            ctx.stroke();
+        }
+
+        for (const pt of hand) {
+            ctx.beginPath();
+            ctx.arc(pt.x * width, pt.y * height, 5, 0, 2 * Math.PI);
+            ctx.fillStyle = '#e74c3c';
+            ctx.fill();
+        }
+    }
+}
+
+// ── Real-Time Prediction Loop ─────────────────────────────────────────────────
+async function predictLoop() {
+    if (!active) return;
+
+    if (webcamVideo.currentTime !== lastVideoTime) {
+        lastVideoTime = webcamVideo.currentTime;
+
+        // Sync canvas coordinates with video size
+        if (webcamCanvas.width !== webcamVideo.videoWidth) {
+            webcamCanvas.width = webcamVideo.videoWidth;
+            webcamCanvas.height = webcamVideo.videoHeight;
+        }
+
+        try {
+            const now = performance.now();
+
+            // Optional preprocessing: contrast/brightness/saturation boost
+            let inputSource = webcamVideo;
+            if (enhanceEnabled) {
+                if (procCanvas.width !== webcamVideo.videoWidth) {
+                    procCanvas.width = webcamVideo.videoWidth;
+                    procCanvas.height = webcamVideo.videoHeight;
+                }
+                procCtx.filter = 'contrast(1.25) brightness(1.1) saturate(1.05)';
+                procCtx.drawImage(webcamVideo, 0, 0);
+                inputSource = procCanvas;
+            }
+
+            const results = recognizer.recognizeForVideo(inputSource, now);
+
+            // Pipeline is live once the first inference completes — even with
+            // no hand in frame. The overlay must NOT wait for a hand.
+            if (!_pipelineReady) {
+                _pipelineReady = true;
+                if (loadingOverlay) loadingOverlay.style.display = 'none';
+                if (gestureResult && !pendingStack.length) gestureResult.textContent = 'Show your hand to begin';
+            }
+
+            // Collect one detection per hand so both hands can queue commands
+            const handDetections = [];
+            const handLandmarks = results.landmarks || results.handLandmarks || [];
+
+            if (results.gestures && results.gestures.length > 0) {
+                for (let i = 0; i < results.gestures.length; i++) {
+                    const hand_gestures = results.gestures[i];
+                    if (!hand_gestures || hand_gestures.length === 0) continue;
+
+                    const top = hand_gestures[0];
+                    const score = Math.round(top.score * 100);
+                    const gestureName = (top.categoryName || top.category_name || '').replace(/\s+/g, '');
+
+                    // Stable per-hand identity: prefer handedness label, fall back to
+                    // the horizontal centroid of the hand landmarks.
+                    let handKey = '';
+                    if (results.handedness && results.handedness[i] && results.handedness[i][0]) {
+                        handKey = results.handedness[i][0].categoryName
+                            || results.handedness[i][0].displayName
+                            || '';
+                    }
+                    if (!handKey) {
+                        const lm = handLandmarks[i];
+                        if (lm && lm.length) {
+                            let sx = 0;
+                            for (const p of lm) sx += p.x;
+                            handKey = (sx / lm.length) < 0.5 ? 'Left' : 'Right';
+                        }
+                    }
+                    if (!handKey) handKey = `hand_${i}`;
+
+                    handDetections.push({ key: handKey, gesture: gestureName, confidence: score });
+                }
+            }
+
+            updateGestureView(handDetections);
+            drawLandmarks(handLandmarks);
+
+        } catch (e) {
+            console.error('Recognition error:', e);
+        }
+    }
+
+    requestAnimationFrame(predictLoop);
+}
+
+// ── Start / Stop controls ─────────────────────────────────────────────────────
+async function startWebcam() {
+    const token = ++_startToken;
+    try {
+        if (enableBtn) {
+            enableBtn.disabled = true;
+            enableBtn.textContent = 'Preparing…';
+        }
+
+        _pipelineReady = false;
+        active = true; // Active from the start of preparation so the idle session timeout stays suspended while the model/camera load
+        if (loadingOverlay) loadingOverlay.style.display = '';
+        setLoadingLabel('Loading AI model…');
+
+        // Model download/compile and camera warm-up run CONCURRENTLY (the old
+        // code awaited them one after another, summing both waits). The
+        // permission prompt also appears immediately, so user think-time
+        // overlaps the download instead of adding to it.
+        const modelP = initializeRecognizer().then(function () {
+            if (token === _startToken) setLoadingLabel('Starting camera…');
+        });
+        const cameraP = withTimeout(
+            navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480, facingMode: "user" }
+            }),
+            20000,
+            'Camera start'
+        ).then(function (m) {
+            // Model failed (or reset) while the camera succeeded → don't leak tracks.
+            if (token !== _startToken) {
+                m.getTracks().forEach(function (t) { t.stop(); });
+                throw new Error('aborted');
+            }
+            return m;
+        });
+        await modelP;
+        if (token !== _startToken) return; // aborted mid-preparation
+        const media = await cameraP;
+        stream = media;
+
+        webcamVideo.srcObject = stream;
+        webcamVideo.style.display = 'block';
+        webcamCanvas.style.display = 'block';
+
+        if (enableBtn) enableBtn.style.display = 'none';
+        if (disableBtn) disableBtn.style.display = 'block';
+
+        const wc = document.getElementById('statusWebcam');
+        if (wc) { wc.textContent = 'Active'; wc.className = 'text-success'; }
+
+        active = true;
+
+        // Video listeners are attached once (module scope) — re-attaching on
+        // every enable stacked duplicate rAF inference loops and the pipeline
+        // got progressively slower with each toggle.
+        attachVideoListenersOnce();
+        if (webcamVideo.readyState >= 2) {
+            predictLoop();
+        }
+
+    } catch (e) {
+        if (token !== _startToken) return;
+        console.error('startWebcam failed:', e);
+        if (loadingOverlay) loadingOverlay.style.display = 'none';
+        if (typeof window.showCameraWarningModal === 'function') window.showCameraWarningModal();
+        resetState();
+    }
+}
+
+function resetState() {
+    _startToken++; // cancel any in-flight startWebcam() so a reset actually aborts preparation
+    active = false;
+    _pipelineReady = false;
+    setLoadingLabel('Preparing gesture control...');
+    if (loadingOverlay) loadingOverlay.style.display = 'none';
+    if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+    }
+    webcamVideo.srcObject = null;
+    webcamVideo.style.display = 'none';
+    webcamCanvas.style.display = 'none';
+
+    if (enableBtn) {
+        enableBtn.disabled = false;
+        enableBtn.style.display = 'block';
+        enableBtn.innerHTML = '<i class="bi bi-camera-video me-1"></i>Enable Camera';
+    }
+    if (disableBtn) disableBtn.style.display = 'none';
+
+    const wc = document.getElementById('statusWebcam');
+    if (wc) { wc.textContent = 'Disabled'; wc.className = 'text-muted'; }
+
+    // Reset any queued commands and per-hand state machines
+    clearPendingTimeout();
+    pendingStack = [];
+    handStates.clear();
+    renderStackQueue();
+    updatePillsState();
+
+    updateGestureView([]);
+    const ctx = webcamCanvas.getContext('2d');
+    ctx.clearRect(0, 0, webcamCanvas.width, webcamCanvas.height);
+}
+
+// Expose for external callers (session timeout, etc.)
+window.resetCameraState = resetState;
+window.isGestureCameraActive = function () { return active; };
+window.showCameraWarningModal = function () {
+    const m = document.getElementById('cameraWarningModal');
+    if (m) m.classList.add('active');
+};
+window.hideCameraWarningModal = function () {
+    const m = document.getElementById('cameraWarningModal');
+    if (m) m.classList.remove('active');
+};
+
+if (enableBtn) {
+    enableBtn.addEventListener('click', startWebcam);
+}
+if (disableBtn) {
+    disableBtn.addEventListener('click', resetState);
+}
+
+// Attach video→loop wiring exactly once; predictLoop() early-returns while
+// inactive, so idle events are harmless.
+function attachVideoListenersOnce() {
+    if (_videoListenersAttached || !webcamVideo) return;
+    _videoListenersAttached = true;
+    webcamVideo.addEventListener('loadedmetadata', predictLoop);
+    webcamVideo.addEventListener('loadeddata', predictLoop);
+    webcamVideo.addEventListener('playing', predictLoop);
+}
+attachVideoListenersOnce();
+
+// Warm the AI model while the page idles so the first activation usually
+// skips the multi-MB download + compile entirely. Quiet: no button changes;
+// a failed preload simply retries on explicit start.
+function preloadGestureModel() {
+    initializeRecognizer(true).catch(function (e) {
+        console.warn('Gesture model preload failed (will retry on enable):', e);
+    });
+}
+if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+    requestIdleCallback(preloadGestureModel, { timeout: 8000 });
+} else {
+    setTimeout(preloadGestureModel, 3000);
+}

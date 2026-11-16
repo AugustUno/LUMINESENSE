@@ -1,0 +1,709 @@
+<?php
+date_default_timezone_set('Asia/Manila');
+require_once __DIR__ . "/../src/Config/db_connect.php";
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use Dompdf\Dompdf;
+
+$tab    = $_GET['tab'] ?? 'activity';
+$search = $_GET['search'] ?? '';
+$type   = $_GET['type'] ?? '';
+$actorFilter  = strtolower($_GET['actor'] ?? '');
+$sourceFilter = strtolower($_GET['source'] ?? '');
+$date   = $_GET['date'] ?? '';
+$fromParam = (isset($_GET['from']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $_GET['from'])) ? $_GET['from'] : '';
+$toParam   = (isset($_GET['to']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $_GET['to'])) ? $_GET['to'] : '';
+
+// Chart cross-filter (parity with the on-screen Status panel, multi-select).
+$CROSS_KEYS = ['durations', 'types', 'perRoom', 'toggles'];
+
+function pdf_normalize_series(string $s): string
+{
+    $s = strtolower(trim($s));
+    if ($s === 'on' || $s === 'light_on') return 'light_on';
+    if ($s === 'off' || $s === 'light_off') return 'light_off';
+    return '';
+}
+
+$cross = [];
+foreach ($CROSS_KEYS as $k) $cross[$k] = [];
+$crossRaw = is_string($_GET['cross'] ?? null) ? trim($_GET['cross']) : '';
+if ($crossRaw !== '') {
+    $decoded = json_decode($crossRaw, true);
+    if (is_array($decoded)) {
+        foreach ($CROSS_KEYS as $k) {
+            if (empty($decoded[$k]) || !is_array($decoded[$k])) continue;
+            $seen = [];
+            foreach ($decoded[$k] as $p) {
+                $value = (is_array($p) && is_scalar($p['value'] ?? null)) ? trim((string)$p['value']) : '';
+                $series = pdf_normalize_series((is_array($p) && is_scalar($p['series'] ?? null)) ? (string)$p['series'] : '');
+                if ($value === '' && $series === '') continue;
+                if (mb_strlen($value) > 120) $value = mb_substr($value, 0, 120);
+                $sig = $value . "\0" . $series;
+                if (isset($seen[$sig])) continue;
+                $seen[$sig] = true;
+                $cross[$k][] = ['value' => $value, 'series' => $series];
+            }
+        }
+    }
+}
+
+// Legacy single-chart params still supported.
+$chartKey = is_string($_GET['chart'] ?? null) ? $_GET['chart'] : '';
+if (!in_array($chartKey, $CROSS_KEYS, true)) $chartKey = '';
+$chartValue = is_string($_GET['chartValue'] ?? null) ? trim($_GET['chartValue']) : '';
+$chartSeries = pdf_normalize_series(is_string($_GET['chartSeries'] ?? null) ? $_GET['chartSeries'] : '');
+if ($chartValue === '' && !(in_array($chartKey, ['durations', 'toggles'], true) && $chartSeries !== '')) $chartKey = '';
+if ($chartKey !== '' && empty($cross[$chartKey])) {
+    $cross[$chartKey][] = ['value' => $chartValue, 'series' => $chartSeries];
+}
+foreach ($cross as $k => $picks) {
+    $cross[$k] = array_values(array_filter($picks, function (array $p) use ($k): bool {
+        if ($k === 'types' || $k === 'perRoom') return $p['value'] !== '';
+        return $p['value'] !== '' || $p['series'] !== '';
+    }));
+}
+$chartsActivePdf = [];
+foreach ($cross as $k => $picks) if (!empty($picks)) $chartsActivePdf[] = $k;
+
+function pdf_chart_bucket(array $log, array $issueActions): string
+{
+    $action = $log['action'] ?? '';
+    if (($log['log_type'] ?? '') === 'admin') return 'Admin';
+    if ($action === 'light_on' || $action === 'light_off') return 'Lights';
+    if (in_array($action, $issueActions, true)) return 'Anomalies';
+    if (str_starts_with($action, 'pir_')) return 'PIR Motion';
+    if (str_starts_with($action, 'class_')) return 'Class';
+    return 'Other Room';
+}
+
+function pdf_pick_matches(array $log, array $pick, string $key, array $roomNames, array $topRooms, array $issueActions): bool
+{
+    $action = $log['action'] ?? '';
+    $target = $log['target'] ?? '';
+    $value = $pick['value'];
+    $series = $pick['series'];
+    if ($key === 'types') return $value !== '' && pdf_chart_bucket($log, $issueActions) === $value;
+    if ($key === 'perRoom') {
+        if ($value === '') return false;
+        $isRoom = ($target !== '' && isset($roomNames[$target]));
+        if ($value === 'Other') return !$isRoom || !in_array($target, $topRooms, true);
+        return $target === $value;
+    }
+    if (empty($log['_light'])) return false;
+    if ($value !== '' && $target !== $value) return false;
+    if ($series !== '' && $action !== $series) return false;
+    return true;
+}
+
+function pdf_matches_charts(array $log, array $cross, array $roomNames, array $topRooms, array $issueActions): bool
+{
+    foreach ($cross as $key => $picks) {
+        if (empty($picks)) continue;
+        $ok = false;
+        foreach ($picks as $p) {
+            if (pdf_pick_matches($log, $p, $key, $roomNames, $topRooms, $issueActions)) { $ok = true; break; }
+        }
+        if (!$ok) return false;
+    }
+    return true;
+}
+if ($fromParam !== '' && $toParam !== '' && $fromParam > $toParam) { $tmp = $fromParam; $fromParam = $toParam; $toParam = $tmp; }
+// Explicit From/To range wins over the preset (validated YYYY-MM-DD above,
+// safe to interpolate). Returns '' when no custom range is set.
+function pdf_range_cond(string $col): string
+{
+    global $fromParam, $toParam;
+    if ($fromParam !== '' && $toParam !== '') return "DATE($col) BETWEEN '$fromParam' AND '$toParam'";
+    if ($fromParam !== '') return "DATE($col) >= '$fromParam'";
+    if ($toParam !== '') return "DATE($col) <= '$toParam'";
+    return '';
+}
+$today  = date('Y-m-d');
+$weekAgo = date('Y-m-d', strtotime('-7 days'));
+$monthAgo = date('Y-m-d', strtotime('-30 days'));
+
+$html = '';
+
+/* - Helper: event icon colors for PDF - */
+function pdfEventStyle(string $action): array {
+    $map = [
+        'issue_raised'   => ['#842029', '#f8d7da'],
+        'issue_resolved' => ['#0f5132', '#d1e7dd'],
+        'tilt_alert'     => ['#7f1d1d', '#fee2e2'],
+        'light_on'       => ['#0f5132', '#d1e7dd'],
+        'light_off'      => ['#842029', '#f8d7da'],
+        'pir_motion'     => ['#084298', '#cfe2ff'],
+        'pir_stopped'    => ['#5a5a5a', '#e9ecef'],
+        'class_start'    => ['#0d6e3b', '#d1e7dd'],
+        'class_end'      => ['#6c4c00', '#fff3cd'],
+    ];
+    return $map[$action] ?? ['#5a5a5a', '#e9ecef'];
+}
+
+/* Display label for anomaly rows (mirrors issue_label() in admin-reports.php) */
+function pdf_issue_label(string $event, string $actor): string {
+    $actor = strtolower(trim($actor));
+    if ($event === 'tilt_alert') return 'Tilt Alert';
+    if ($event === 'issue_resolved') {
+        return ($actor === 'pzem') ? 'Power Normal' : 'Issue Resolved';
+    }
+    if ($actor === 'pir') return 'Motion Outside Schedule';
+    if ($actor === 'pzem') return 'Power Spike';
+    return 'Issue Raised';
+}
+
+if ($tab === 'rooms') {
+    $rooms = [];
+    $where = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $where[] = "(c.room_name LIKE '%$s%' OR c.description LIKE '%$s%')";
+    }
+
+    $lightFilter = $type; // roomLightFilter value
+    if ($lightFilter === 'on' || $lightFilter === 'off') {
+        $lf = $conn->real_escape_string($lightFilter);
+        $where[] = "COALESCE((SELECT l.event_type FROM lighting_logs l WHERE l.classroom_id = c.id ORDER BY l.id DESC LIMIT 1),'off') = '$lf'";
+    } elseif ($lightFilter === 'pir_motion') {
+        $where[] = "c.pir_occupied = 1";
+    }
+
+    $whereClause = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+
+    $res = $conn->query("
+        SELECT
+            c.id, c.room_name, c.room_size, c.description,
+            COALESCE(
+                (SELECT l.event_type FROM lighting_logs l
+                 WHERE l.classroom_id = c.id
+                 ORDER BY l.id DESC LIMIT 1),
+                'off'
+            ) AS light_status,
+            (
+                COALESCE((SELECT COUNT(*) FROM room_logs WHERE room_name = c.room_name), 0) +
+                COALESCE((SELECT COUNT(*) FROM lighting_logs WHERE classroom_id = c.id), 0) +
+                COALESCE((SELECT COUNT(*) FROM pir_logs WHERE classroom_id = c.id), 0) +
+                COALESCE((SELECT COUNT(*) FROM class_logs WHERE classroom_id = c.id), 0)
+            ) AS total_events,
+            (
+                GREATEST(
+                    COALESCE((SELECT MAX(event_time) FROM room_logs WHERE room_name = c.room_name), '1970-01-01 00:00:00'),
+                    COALESCE((SELECT MAX(event_time) FROM lighting_logs WHERE classroom_id = c.id), '1970-01-01 00:00:00'),
+                    COALESCE((SELECT MAX(created_at) FROM pir_logs WHERE classroom_id = c.id), '1970-01-01 00:00:00'),
+                    COALESCE((SELECT MAX(event_time) FROM class_logs WHERE classroom_id = c.id), '1970-01-01 00:00:00')
+                )
+            ) AS last_event
+        FROM classrooms c
+        $whereClause
+        ORDER BY c.room_name ASC
+    ");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            if ($row['last_event'] === '1970-01-01 00:00:00') {
+                $row['last_event'] = null;
+            }
+            $rooms[] = $row;
+        }
+        $res->free();
+    }
+
+    $html = '<h2 style="text-align:center;margin-bottom:20px;">Room Activity Summary</h2>';
+    if ($search) $html .= '<p style="text-align:center;color:#888;font-size:10px;">Filtered by: "' . htmlspecialchars($search) . '"</p>';
+    $html .= '<table><thead><tr>
+        <th>Room</th><th>Light Status</th><th>Size</th><th>Total Events</th><th>Last Activity</th><th>Description</th>
+    </tr></thead><tbody>';
+    if (empty($rooms)) {
+        $html .= '<tr><td colspan="6" style="text-align:center;color:#999;">No rooms match the current filters.</td></tr>';
+    } else {
+        foreach ($rooms as $room) {
+            $on = $room['light_status'] === 'on';
+            $statusLabel = $on ? 'ON' : 'OFF';
+            $statusColor = $on ? '#0f5132' : '#842029';
+            $statusBg = $on ? '#d1e7dd' : '#f8d7da';
+            $lastStr = !empty($room['last_event']) ? date('M j, g:i A', strtotime($room['last_event'])) : 'No events yet';
+            $html .= '<tr>';
+            $html .= '<td style="font-weight:700;">' . htmlspecialchars($room['room_name']) . '</td>';
+            $html .= '<td><span style="background:' . $statusBg . ';color:' . $statusColor . ';padding:2px 10px;border-radius:20px;font-weight:700;font-size:11px;">' . $statusLabel . '</span></td>';
+            $html .= '<td>' . ucfirst(htmlspecialchars($room['room_size'])) . '</td>';
+            $html .= '<td>' . (int)$room['total_events'] . '</td>';
+            $html .= '<td>' . $lastStr . '</td>';
+            $html .= '<td style="color:#888;font-size:10px;">' . htmlspecialchars($room['description'] ?? '-') . '</td>';
+            $html .= '</tr>';
+        }
+    }
+    $html .= '</tbody></table>';
+} elseif ($tab === 'faculty') {
+    $where = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $where[] = "(CONCAT(f.first_name,' ',f.last_name) LIKE '%$s%' OR f.email LIKE '%$s%')";
+    }
+    if ($type === 'approved') {
+        $where[] = "(f.is_verified = 1 AND f.approved_by IS NOT NULL)";
+    } elseif ($type === 'pending') {
+        $where[] = "(f.is_verified = 1 AND f.approved_by IS NULL)";
+    } elseif ($type === 'other') {
+        $where[] = "NOT (f.is_verified = 1)";
+    }
+    $whereClause = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+    $faculty = [];
+    $res = $conn->query("SELECT id, first_name, last_name, email, is_verified, approved_by FROM faculty $whereClause ORDER BY last_name ASC, first_name ASC LIMIT 500");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) $faculty[] = $row;
+        $res->free();
+    }
+    $hasFidSched = ($conn->query("SHOW COLUMNS FROM schedules LIKE 'faculty_id'")->num_rows ?? 0) > 0;
+    $hasCbSched = ($conn->query("SHOW COLUMNS FROM schedules LIKE 'created_by'")->num_rows ?? 0) > 0;
+    $hasFidLight = ($conn->query("SHOW COLUMNS FROM lighting_logs LIKE 'faculty_id'")->num_rows ?? 0) > 0;
+    $hasExt = ($conn->query("SHOW TABLES LIKE 'extension_requests'")->num_rows ?? 0) > 0;
+    $html = '<h2 style="text-align:center;margin-bottom:20px;">Faculty Reports</h2>';
+    if ($search) $html .= '<p style="text-align:center;color:#888;font-size:10px;">Filtered by: "' . htmlspecialchars($search) . '"</p>';
+    $html .= '<table><thead><tr>
+        <th>Faculty</th><th>Status</th><th>Schedules</th><th>Extensions</th><th>Lighting Events</th>
+    </tr></thead><tbody>';
+    if (empty($faculty)) {
+        $html .= '<tr><td colspan="5" style="text-align:center;color:#999;">No faculty match the current filters.</td></tr>';
+    } else {
+        foreach ($faculty as $f) {
+            $fid = (int)$f['id'];
+            $approved = ((int)$f['is_verified'] === 1 && $f['approved_by'] !== null);
+            $pending = ((int)$f['is_verified'] === 1 && $f['approved_by'] === null);
+            $sched = 0; $ext = 0; $light = 0;
+            if ($hasFidSched || $hasCbSched) {
+                $conds = [];
+                if ($hasFidSched) $conds[] = "faculty_id = $fid";
+                if ($hasCbSched) $conds[] = "created_by = $fid";
+                $q = $conn->query("SELECT COUNT(*) AS c FROM schedules WHERE " . implode(' OR ', $conds));
+                if ($q && ($r = $q->fetch_assoc())) $sched = (int)($r['c'] ?? 0);
+                if ($q) $q->free();
+            }
+            if ($hasExt) {
+                $q = $conn->query("SELECT COUNT(*) AS c FROM extension_requests WHERE faculty_id = $fid");
+                if ($q && ($r = $q->fetch_assoc())) $ext = (int)($r['c'] ?? 0);
+                if ($q) $q->free();
+            }
+            if ($hasFidLight) {
+                $q = $conn->query("SELECT COUNT(*) AS c FROM lighting_logs WHERE faculty_id = $fid");
+                if ($q && ($r = $q->fetch_assoc())) $light = (int)($r['c'] ?? 0);
+                if ($q) $q->free();
+            }
+            $html .= '<tr>';
+            $html .= '<td style="font-weight:600;">' . htmlspecialchars(trim(($f['first_name'] ?? '') . ' ' . ($f['last_name'] ?? ''))) . '<br><span style="color:#888;font-size:10px;">' . htmlspecialchars($f['email'] ?? '') . '</span></td>';
+            $html .= '<td>' . ($approved ? 'Approved' : ($pending ? 'Pending' : 'Unverified')) . '</td>';
+            $html .= '<td>' . $sched . '</td>';
+            $html .= '<td>' . $ext . '</td>';
+            $html .= '<td>' . $light . '</td>';
+            $html .= '</tr>';
+        }
+    }
+    $html .= '</tbody></table>';
+} elseif ($tab === 'issues') {
+    $where = ["event_type IN ('issue_raised','issue_resolved','tilt_alert')"];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $where[] = "(room_name LIKE '%$s%' OR notes LIKE '%$s%' OR triggered_by LIKE '%$s%')";
+    }
+    if ($type) {
+        $t = $conn->real_escape_string($type);
+        $where[] = "event_type = '$t'";
+    }
+    if (($rc = pdf_range_cond('event_time')) !== '') {
+        $where[] = $rc;
+    } elseif ($date === 'today') {
+        $where[] = "DATE(event_time) = '$today'";
+    } elseif ($date === 'week') {
+        $where[] = "DATE(event_time) >= '$weekAgo'";
+    } elseif ($date === 'month') {
+        $where[] = "DATE(event_time) >= '$monthAgo'";
+    }
+
+    $whereClause = 'WHERE ' . implode(' AND ', $where);
+    $issues = [];
+    $res = $conn->query("
+        SELECT id, event_type, room_name, triggered_by, event_time, COALESCE(notes,'') AS notes
+        FROM room_logs
+        $whereClause
+        ORDER BY event_time DESC
+        LIMIT 200
+    ");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) $issues[] = $row;
+        $res->free();
+    }
+
+    $html = '<h2 style="text-align:center;margin-bottom:20px;">Issues Logged</h2>';
+    if ($search) $html .= '<p style="text-align:center;color:#888;font-size:10px;">Filtered by: "' . htmlspecialchars($search) . '"</p>';
+    $html .= '<table><thead><tr>
+        <th>Time</th><th>Issue</th><th>Room</th><th>Triggered By</th><th>Notes</th>
+    </tr></thead><tbody>';
+    if (empty($issues)) {
+        $html .= '<tr><td colspan="5" style="text-align:center;color:#999;">No issues match the current filters.</td></tr>';
+    } else {
+        foreach ($issues as $issue) {
+            [$fg, $bg] = pdfEventStyle($issue['event_type']);
+            $label = pdf_issue_label($issue['event_type'], $issue['triggered_by'] ?? '');
+            $timeStr = date('M j, Y g:i A', strtotime($issue['event_time']));
+            $html .= '<tr>';
+            $html .= '<td style="white-space:nowrap;">' . $timeStr . '</td>';
+            $html .= '<td><span style="background:' . $bg . ';color:' . $fg . ';padding:2px 10px;border-radius:20px;font-weight:700;font-size:10px;">' . $label . '</span></td>';
+            $html .= '<td style="font-weight:600;">' . htmlspecialchars($issue['room_name']) . '</td>';
+            $html .= '<td>' . htmlspecialchars($issue['triggered_by']) . '</td>';
+            $html .= '<td style="color:#888;font-size:10px;">' . htmlspecialchars($issue['notes']) . '</td>';
+            $html .= '</tr>';
+        }
+    }
+    $html .= '</tbody></table>';
+    } elseif ($tab === 'flush_archive') {
+        $registryId = (int)($_GET['id'] ?? 0);
+        if ($registryId <= 0) {
+            $title = 'Flush Archive';
+            $subtitle = 'No archive ID specified';
+            $html = '<p>No archive ID provided.</p>';
+        } else {
+            $arch = $conn->query("SELECT * FROM archive_registry WHERE id = {$registryId}")->fetch_assoc();
+            if (!$arch) {
+                $title = 'Flush Archive';
+                $subtitle = 'Archive not found';
+                $html = '<p>Archive not found.</p>';
+            } else {
+                $title = 'Flush Archive Detail';
+                $subtitle = $arch['semester'] . ' ' . $arch['academic_year'] . ' | ' . date('M j, Y g:i A', strtotime($arch['flush_at']));
+                $schedQ = $conn->query("SELECT COUNT(*) as cnt FROM archived_schedules WHERE registry_id = {$registryId}");
+                $deptQ = $conn->query("SELECT COUNT(*) as cnt FROM archived_departments WHERE registry_id = {$registryId}");
+                $subjQ = $conn->query("SELECT COUNT(*) as cnt FROM archived_subjects WHERE registry_id = {$registryId}");
+                $extQ = $conn->query("SELECT COUNT(*) as cnt FROM archived_extension_requests WHERE registry_id = {$registryId}");
+                $schedCnt = $schedQ ? $schedQ->fetch_assoc()['cnt'] : 0;
+                $deptCnt = $deptQ ? $deptQ->fetch_assoc()['cnt'] : 0;
+                $subjCnt = $subjQ ? $subjQ->fetch_assoc()['cnt'] : 0;
+                $extCnt = $extQ ? $extQ->fetch_assoc()['cnt'] : 0;
+                $html = '<h2>Flush Archive</h2>';
+                $html .= '<p><strong>Semester:</strong> ' . htmlspecialchars($arch['semester'] . ' ' . $arch['academic_year']) . '</p>';
+                $html .= '<p><strong>Flushed:</strong> ' . date('M j, Y g:i A', strtotime($arch['flush_at'])) . '</p>';
+                $html .= '<p><strong>Archived:</strong> ' . number_format($arch['total_archived']) . ' records | <strong>Deleted:</strong> ' . number_format($arch['total_deleted']) . ' records</p>';
+                $html .= '<table border="1" cellpadding="4" cellspacing="0" width="100%">';
+                $html .= '<tr><th>Category</th><th>Records</th></tr>';
+                $html .= '<tr><td>Schedules</td><td>' . number_format($schedCnt) . '</td></tr>';
+                $html .= '<tr><td>Departments</td><td>' . number_format($deptCnt) . '</td></tr>';
+                $html .= '<tr><td>Subjects</td><td>' . number_format($subjCnt) . '</td></tr>';
+                $html .= '<tr><td>Extension Requests</td><td>' . number_format($extCnt) . '</td></tr>';
+                $html .= '</table>';
+            }
+        }
+    } elseif ($tab === 'pzem_archive') {
+        $title = 'PZEM Archive';
+        $subtitle = 'Daily energy data aggregation history';
+        $result = $conn->query("SELECT archive_date, total_readings, records_archived, records_purged FROM pzem_archive ORDER BY archive_date DESC LIMIT 50");
+        $html = '<h2>PZEM Archive</h2>';
+        $html .= '<table border="1" cellpadding="4" cellspacing="0" width="100%">';
+        $html .= '<tr><th>Date</th><th>Total Readings</th><th>Archived</th><th>Purged</th></tr>';
+        if ($result) {
+            while ($row = $result->fetch_assoc()) {
+                $html .= '<tr>';
+                $html .= '<td>' . date('M j, Y', strtotime($row['archive_date'])) . '</td>';
+                $html .= '<td>' . number_format($row['total_readings']) . '</td>';
+                $html .= '<td>' . number_format($row['records_archived']) . '</td>';
+                $html .= '<td>' . number_format($row['records_purged']) . '</td>';
+                $html .= '</tr>';
+            }
+        }
+        $html .= '</table>';
+    } else {
+    // - Activity tab -
+    $activity_logs = [];
+
+    $roomWhere = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $roomWhere[] = "(room_name LIKE '%$s%' OR triggered_by LIKE '%$s%' OR event_type LIKE '%$s%' OR notes LIKE '%$s%')";
+    }
+    if (($rc = pdf_range_cond('event_time')) !== '') {
+        $roomWhere[] = $rc;
+    } elseif ($date === 'today') {
+        $roomWhere[] = "DATE(event_time) = '$today'";
+    } elseif ($date === 'week') {
+        $roomWhere[] = "DATE(event_time) >= '$weekAgo'";
+    } elseif ($date === 'month') {
+        $roomWhere[] = "DATE(event_time) >= '$monthAgo'";
+    }
+    $roomWhereClause = $roomWhere ? 'WHERE ' . implode(' AND ', $roomWhere) : '';
+
+    // room_logs
+    $res = $conn->query("
+        SELECT 'room' AS log_type, id, event_type AS action,
+               room_name AS target, triggered_by AS actor,
+               event_time AS log_time, COALESCE(notes,'') AS notes
+        FROM room_logs
+        $roomWhereClause
+        ORDER BY event_time DESC LIMIT 200
+    ");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) $activity_logs[] = $row;
+        $res->free();
+    }
+
+    // pir_logs
+    $pirWhere = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $pirWhere[] = "(c.room_name LIKE '%$s%' OR 'PIR' LIKE '%$s%')";
+    }
+    if (($rc = pdf_range_cond('pl.created_at')) !== '') {
+        $pirWhere[] = $rc;
+    } elseif ($date === 'today') {
+        $pirWhere[] = "DATE(pl.created_at) = '$today'";
+    } elseif ($date === 'week') {
+        $pirWhere[] = "DATE(pl.created_at) >= '$weekAgo'";
+    } elseif ($date === 'month') {
+        $pirWhere[] = "DATE(pl.created_at) >= '$monthAgo'";
+    }
+    $pirWhereClause = $pirWhere ? 'AND ' . implode(' AND ', $pirWhere) : '';
+
+    $res3 = $conn->query("
+        SELECT 'room' AS log_type, pl.id,
+               CASE pl.state WHEN 1 THEN 'pir_motion' ELSE 'pir_stopped' END AS action,
+               c.room_name AS target, 'PIR' AS actor,
+               pl.created_at AS log_time, '' AS notes
+        FROM pir_logs pl
+        JOIN classrooms c ON c.id = pl.classroom_id
+        $pirWhereClause
+        ORDER BY pl.created_at DESC LIMIT 200
+    ");
+    if ($res3) {
+        while ($row = $res3->fetch_assoc()) $activity_logs[] = $row;
+        $res3->free();
+    }
+
+    // class_logs
+    $classWhere = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $classWhere[] = "(c.room_name LIKE '%$s%' OR cl.triggered_by LIKE '%$s%' OR cl.event_type LIKE '%$s%')";
+    }
+    if (($rc = pdf_range_cond('cl.event_time')) !== '') {
+        $classWhere[] = $rc;
+    } elseif ($date === 'today') {
+        $classWhere[] = "DATE(cl.event_time) = '$today'";
+    } elseif ($date === 'week') {
+        $classWhere[] = "DATE(cl.event_time) >= '$weekAgo'";
+    } elseif ($date === 'month') {
+        $classWhere[] = "DATE(cl.event_time) >= '$monthAgo'";
+    }
+    $classWhereClause = $classWhere ? 'AND ' . implode(' AND ', $classWhere) : '';
+
+    $res4 = $conn->query("
+        SELECT 'room' AS log_type, cl.id, cl.event_type AS action,
+               c.room_name AS target, COALESCE(cl.triggered_by,'schedule') AS actor,
+               cl.event_time AS log_time, COALESCE(cl.notes,'') AS notes
+        FROM class_logs cl
+        JOIN classrooms c ON c.id = cl.classroom_id
+        $classWhereClause
+        ORDER BY cl.event_time DESC LIMIT 200
+    ");
+    if ($res4) {
+        while ($row = $res4->fetch_assoc()) $activity_logs[] = $row;
+        $res4->free();
+    }
+
+    // lighting_logs (physical on/off only)
+    $lightWhere = [];
+    if ($search) {
+        $s = $conn->real_escape_string($search);
+        $lightWhere[] = "(c.room_name LIKE '%$s%' OR l.triggered_by LIKE '%$s%' OR l.event_type LIKE '%$s%')";
+    }
+    if (($rc = pdf_range_cond('l.event_time')) !== '') {
+        $lightWhere[] = $rc;
+    } elseif ($date === 'today') {
+        $lightWhere[] = "DATE(l.event_time) = '$today'";
+    } elseif ($date === 'week') {
+        $lightWhere[] = "DATE(l.event_time) >= '$weekAgo'";
+    } elseif ($date === 'month') {
+        $lightWhere[] = "DATE(l.event_time) >= '$monthAgo'";
+    }
+    $lightWhereClause = $lightWhere ? 'AND ' . implode(' AND ', $lightWhere) : '';
+
+    $resL = $conn->query("
+        SELECT 'room' AS log_type, l.id,
+               CASE l.event_type WHEN 'on' THEN 'light_on' ELSE 'light_off' END AS action,
+               c.room_name AS target, COALESCE(NULLIF(l.triggered_by,''),'Manual') AS actor,
+               l.event_time AS log_time, '' AS notes
+        FROM lighting_logs l
+        JOIN classrooms c ON c.id = l.classroom_id
+        WHERE l.event_type IN ('on', 'off')
+        $lightWhereClause
+        ORDER BY l.event_time DESC LIMIT 200
+    ");
+    if ($resL) {
+        while ($row = $resL->fetch_assoc()) { $row['_light'] = true; $activity_logs[] = $row; }
+        $resL->free();
+    }
+
+    // admin_logs - only when no type filter excludes 'admin'
+    if (!$type || $type === 'admin') {
+        $adminWhere = ["al.action IN ('faculty_approved','faculty_rejected','faculty_pending','extension_approved','extension_rejected')"];
+        if ($search) {
+            $s = $conn->real_escape_string($search);
+            $adminWhere[] = "(al.target_name LIKE '%$s%' OR CONCAT(a.first_name,' ',a.last_name) LIKE '%$s%' OR al.action LIKE '%$s%')";
+        }
+        if (($rc = pdf_range_cond('al.created_at')) !== '') {
+            $adminWhere[] = $rc;
+        } elseif ($date === 'today') {
+            $adminWhere[] = "DATE(al.created_at) = '$today'";
+        } elseif ($date === 'week') {
+            $adminWhere[] = "DATE(al.created_at) >= '$weekAgo'";
+        } elseif ($date === 'month') {
+            $adminWhere[] = "DATE(al.created_at) >= '$monthAgo'";
+        }
+        $adminWhereClause = 'WHERE ' . implode(' AND ', $adminWhere);
+
+        $res2 = $conn->query("
+            SELECT 'admin' AS log_type, al.id, al.action AS action,
+                   al.target_name AS target,
+                   COALESCE(CONCAT(a.first_name,' ',a.last_name),'System') AS actor,
+                   al.created_at AS log_time, COALESCE(al.notes,'') AS notes
+            FROM admin_logs al
+            LEFT JOIN admins a ON a.id = al.admin_id
+            $adminWhereClause
+            ORDER BY al.created_at DESC LIMIT 200
+        ");
+        if ($res2) {
+            while ($row = $res2->fetch_assoc()) $activity_logs[] = $row;
+            $res2->free();
+        }
+    }
+
+    usort($activity_logs, fn($a, $b) => strtotime($b['log_time']) - strtotime($a['log_time']));
+
+    // Apply type/actor/source filter in PHP (log_type: room/admin, action prefix: pir_*/class_*, or anomaly set)
+    $issueActions = ['issue_raised', 'issue_resolved', 'tilt_alert'];
+    if ($type || $actorFilter || $sourceFilter) {
+        $activity_logs = array_filter($activity_logs, function($log) use ($type, $issueActions, $actorFilter, $sourceFilter) {
+            if ($actorFilter !== '' && strtolower($log['actor'] ?? '') !== $actorFilter) return false;
+            $actorLower = strtolower($log['actor'] ?? '');
+            $isRoom = ($log['log_type'] ?? '') === 'room';
+            $source = !$isRoom ? 'admin' : ($actorLower === 'pir' ? 'pir' : ($actorLower === 'schedule' ? 'schedule' : 'manual'));
+            if ($sourceFilter !== '' && $source !== $sourceFilter) return false;
+            if ($type === 'pir') return str_starts_with($log['action'], 'pir_');
+            if ($type === 'class') return str_starts_with($log['action'], 'class_');
+            if ($type === 'light') return $log['action'] === 'light_on' || $log['action'] === 'light_off';
+            if ($type === 'anomaly') return in_array($log['action'], $issueActions, true);
+            if ($type === 'room') return $log['log_type'] === 'room' && !in_array($log['action'], $issueActions, true);
+            if ($type !== '') return $log['log_type'] === $type;
+            return true;
+        });
+    }
+
+    // Chart cross-filter (multi-select; AND across charts, OR within a chart),
+    // same semantics as api/status-report.php so the export matches the screen.
+    if (!empty($chartsActivePdf)) {
+        $roomNames = [];
+        $q = $conn->query("SELECT room_name FROM classrooms");
+        if ($q) { while ($rr = $q->fetch_assoc()) $roomNames[$rr['room_name']] = true; $q->free(); }
+        // The perRoom chart's own top-7 (its picks excluded) defines "Other",
+        // mirroring the on-screen chart.
+        $otherBase = $activity_logs;
+        if (in_array('perRoom', $chartsActivePdf, true)) {
+            $crossNoRoom = $cross;
+            $crossNoRoom['perRoom'] = [];
+            $otherBase = array_filter($activity_logs, function ($log) use ($crossNoRoom, $issueActions, $roomNames) {
+                return pdf_matches_charts($log, $crossNoRoom, $roomNames, [], $issueActions);
+            });
+        }
+        $perRoomCounts = [];
+        foreach ($otherBase as $log) {
+            $t = $log['target'] ?? '';
+            if ($t !== '' && isset($roomNames[$t])) $perRoomCounts[$t] = ($perRoomCounts[$t] ?? 0) + 1;
+        }
+        arsort($perRoomCounts);
+        $topRooms = array_slice(array_keys($perRoomCounts), 0, 7);
+        $activity_logs = array_filter($activity_logs, function ($log) use ($cross, $issueActions, $roomNames, $topRooms) {
+            return pdf_matches_charts($log, $cross, $roomNames, $topRooms, $issueActions);
+        });
+    }
+
+    $title = ($tab === 'status' ? 'Status Reports' : 'Activity Log');
+    $html = '<h2 style="text-align:center;margin-bottom:20px;">' . $title . '</h2>';
+    if ($search) $html .= '<p style="text-align:center;color:#888;font-size:10px;">Filtered by: "' . htmlspecialchars($search) . '"</p>';
+    if (!empty($chartsActivePdf)) {
+        $parts = [];
+        foreach ($chartsActivePdf as $ck) {
+            $chartLabel = $ck === 'types' ? 'Action type'
+                : ($ck === 'perRoom' ? 'Room' : ($ck === 'durations' ? 'Room (On/Off Hours)' : 'Room (Toggles)'));
+            $vals = [];
+            $seriesVals = [];
+            foreach ($cross[$ck] as $p) {
+                if ($p['value'] !== '') $vals[] = $p['value'];
+                if ($p['series'] !== '') $seriesVals[] = $p['series'] === 'light_on' ? 'On' : 'Off';
+            }
+            if ($vals) $parts[] = $chartLabel . ': ' . implode(', ', array_unique($vals));
+            if ($seriesVals) $parts[] = implode('/', array_unique($seriesVals)) . ' only';
+        }
+        $html .= '<p style="text-align:center;color:#888;font-size:10px;">Chart filters: ' . htmlspecialchars(implode(' · ', $parts)) . '</p>';
+    }
+    $html .= '<table><thead><tr>
+        <th>Action</th><th>Action Type</th><th>Actor</th><th>Source</th><th>Description</th><th>Date and Time</th><th>Notes</th>
+    </tr></thead><tbody>';
+    if (empty($activity_logs)) {
+        $html .= '<tr><td colspan="7" style="text-align:center;color:#999;">No activity logs match the current filters.</td></tr>';
+    } else {
+        foreach ($activity_logs as $log) {
+            $logDate = strtotime($log['log_time']);
+            $timeStr = date('M j, Y g:i A', $logDate);
+            $isRoom = $log['log_type'] === 'room';
+            $typeLabel = $isRoom ? 'Room' : 'Admin';
+            $typeBg = $isRoom ? '#ede6f2' : '#4a0078';
+            $typeClr = $isRoom ? '#4a0078' : '#ede6f2';
+            $actionLabel = in_array($log['action'], $issueActions, true)
+                ? pdf_issue_label($log['action'], $log['actor'] ?? '')
+                : str_replace('Pir ', 'PIR ', ucwords(str_replace('_', ' ', $log['action'])));
+            $actorLower = strtolower($log['actor'] ?? '');
+            $source = !$isRoom ? 'Admin' : ($actorLower === 'pir' ? 'PIR' : ($actorLower === 'schedule' ? 'Schedule' : 'Manual'));
+            $html .= '<tr>';
+            $html .= '<td style="font-weight:600;">' . htmlspecialchars($actionLabel) . '</td>';
+            $html .= '<td><span style="background:' . $typeBg . ';color:' . $typeClr . ';padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;">' . $typeLabel . '</span></td>';
+            $html .= '<td>' . htmlspecialchars($log['actor'] ?? '') . '</td>';
+            $html .= '<td>' . $source . '</td>';
+            $html .= '<td>' . htmlspecialchars($log['target'] ?? '') . '</td>';
+            $html .= '<td style="white-space:nowrap;">' . $timeStr . '</td>';
+            $html .= '<td style="color:#888;font-size:10px;">' . htmlspecialchars($log['notes'] ?? '') . '</td>';
+            $html .= '</tr>';
+        }
+    }
+    $html .= '</tbody></table>';
+}
+
+$html .= '<p style="text-align:center;margin-top:20px;color:#888;font-size:11px;">Generated on ' . date('F j, Y, g:i A') . '</p>';
+
+// Mode=view: return HTML preview instead of PDF
+if (isset($_GET['mode']) && $_GET['mode'] === 'view') {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' . htmlspecialchars($title ?? 'Report') . '</title>';
+    echo '<style>body{font-family:Arial,sans-serif;padding:20px;font-size:13px;}table{width:100%;border-collapse:collapse;margin-top:10px;}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;}th{background:#f5f5f5;font-weight:600;}h2{margin-bottom:2px;}h3{color:#666;font-weight:normal;margin-top:0;}</style>';
+    echo '</head><body>';
+    echo '<h2>' . htmlspecialchars($title ?? 'Report') . '</h2>';
+    if (!empty($subtitle)) echo '<h3>' . htmlspecialchars($subtitle) . '</h3>';
+    echo $html ?? '<p>No data.</p>';
+    echo '</body></html>';
+    exit(0);
+}
+
+$dompdf = new Dompdf();
+$dompdf->setPaper('A4', 'landscape');
+
+$doc = '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+$doc .= '<style>
+    body { font-family: Tahoma, DejaVu Sans, sans-serif; margin: 20px; font-size: 11px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: left; vertical-align: top; }
+    th { background: #58078f; color: #fff; font-weight: 700; font-size: 11px; }
+    tr:nth-child(even) { background: #f9f6fc; }
+</style></head><body>' . $html . '</body></html>';
+
+$dompdf->loadHtml($doc);
+$dompdf->render();
+
+$filename = $title . '.pdf';
+
+header('Content-Type: application/pdf');
+header('Content-Disposition: attachment; filename="' . $filename . '"');
+echo $dompdf->output();

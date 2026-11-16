@@ -1,0 +1,885 @@
+<?php
+date_default_timezone_set('Asia/Manila');
+require_once __DIR__ . "/../../src/Session/session_guard.php";
+check_faculty();
+require_once __DIR__ . "/../../src/Config/db_connect.php";
+
+if (empty($_SESSION['is_head'])) {
+    header('Location: faculty-timetable.php');
+    exit;
+}
+
+$faculty_name = htmlspecialchars($_SESSION['faculty_name']);
+$faculty_id   = (int)$_SESSION['faculty_id'];
+$name_parts   = explode(' ', $faculty_name);
+$first_name   = $name_parts[0];
+$initials     = strtoupper(substr($name_parts[0], 0, 1) . substr(end($name_parts), 0, 1));
+
+// Fetch email
+$faculty_email = '';
+$stmt = $conn->prepare('SELECT email FROM faculty WHERE id = ?');
+$stmt->bind_param('i', $faculty_id);
+$stmt->execute();
+$stmt->bind_result($faculty_email);
+$stmt->fetch();
+$stmt->close();
+
+$member_id    = (int)($_GET['faculty_id'] ?? 0);
+$department_id = (int)($_GET['department_id'] ?? 0);
+if (!$member_id || !$department_id) {
+    header('Location: faculty-head-timetable.php');
+    exit;
+}
+
+// Verify member belongs to any of the departments the head manages
+$member_name = '';
+$member_area = '';
+$stmt = $conn->prepare("
+    SELECT CONCAT(f.first_name, ' ', f.last_name) AS full_name,
+           GROUP_CONCAT(DISTINCT sa.name ORDER BY sa.name SEPARATOR ', ') AS subject_area_name
+    FROM faculty f
+    JOIN junction_faculty_department jfd ON f.id = jfd.faculty_id
+    LEFT JOIN junction_faculty_subjectarea jfsa ON f.id = jfsa.faculty_id
+    LEFT JOIN subject_area sa ON sa.id = jfsa.subject_area_id AND sa.department_id = jfd.department_id
+    JOIN departments d ON d.id = jfd.department_id
+    WHERE f.id = ? 
+      AND d.id = ?
+      AND d.head_faculty_id = ? 
+      AND d.status = 'active'
+    GROUP BY f.id
+    LIMIT 1
+");
+$stmt->bind_param('iii', $member_id, $department_id, $faculty_id);
+$stmt->execute();
+$member = $stmt->get_result()->fetch_assoc();
+$stmt->close();
+
+if (!$member) {
+    header('Location: faculty-head-timetable.php');
+    exit;
+}
+
+$member_name = $member['full_name'];
+$member_area = $member['subject_area_name'] ?: 'No subject area assigned';
+
+$today = date('l');
+$days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+$schedule_by_day = [];
+foreach ($days as $day) $schedule_by_day[$day] = [];
+
+$mid = (int)$member_id;
+$r = $conn->query("
+    SELECT s.id, s.day_of_week, s.start_time, s.end_time, s.classroom_id,
+           s.extended_until, s.subject_id, s.created_by,
+           c.room_name,
+           sub.name AS subject_name,
+           cr.first_name AS creator_first, cr.last_name AS creator_last,
+           (SELECT status FROM extension_requests
+            WHERE schedule_id = s.id AND faculty_id = s.faculty_id
+            ORDER BY requested_at DESC LIMIT 1) AS ext_status
+    FROM schedules s
+    JOIN classrooms c ON c.id = s.classroom_id
+    LEFT JOIN subjects sub ON sub.id = s.subject_id
+    LEFT JOIN faculty cr ON cr.id = s.created_by
+    WHERE s.faculty_id = $mid
+    ORDER BY FIELD(s.day_of_week,'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'),
+             s.start_time
+");
+while ($row = $r->fetch_assoc()) {
+    $schedule_by_day[$row['day_of_week']][] = $row;
+}
+
+// Rooms for edit modal
+$rooms = [];
+$rr = $conn->query('SELECT id, room_name FROM classrooms ORDER BY room_name');
+if ($rr) {
+    while ($row = $rr->fetch_assoc()) $rooms[] = $row;
+}
+
+// Subjects for edit modal (only those directly assigned to this member)
+$subjects = [];
+$sr = $conn->prepare("
+    SELECT DISTINCT s.id, s.name
+    FROM subjects s
+    JOIN junction_faculty_subject jfs ON s.id = jfs.subject_id
+    WHERE jfs.faculty_id = ?
+      AND s.subject_area_id IN (
+          SELECT id FROM subject_area WHERE department_id = ?
+      )
+    ORDER BY s.name
+");
+$sr->bind_param('ii', $member_id, $department_id);
+$sr->execute();
+$res_sr = $sr->get_result();
+if ($res_sr) {
+    while ($row = $res_sr->fetch_assoc()) $subjects[] = $row;
+}
+$sr->close();
+
+// - Member coverage: subject areas and their subjects (within this department) -
+$coverage = [];
+$cov_stmt = $conn->prepare("
+    SELECT sa.id AS sa_id, sa.name AS sa_name, s.id AS subj_id, s.name AS subj_name
+    FROM junction_faculty_subjectarea jfsa
+    JOIN subject_area sa ON sa.id = jfsa.subject_area_id
+    LEFT JOIN junction_faculty_subject jfs ON jfs.faculty_id = jfsa.faculty_id
+    LEFT JOIN subjects s ON s.id = jfs.subject_id AND s.subject_area_id = sa.id
+    WHERE jfsa.faculty_id = ?
+      AND sa.department_id = ?
+    ORDER BY sa.name, s.name
+");
+$cov_stmt->bind_param('ii', $member_id, $department_id);
+$cov_stmt->execute();
+$cov_res = $cov_stmt->get_result();
+while ($row = $cov_res->fetch_assoc()) {
+    $sa_id = $row['sa_id'];
+    if (!isset($coverage[$sa_id])) {
+        $coverage[$sa_id] = ['name' => $row['sa_name'], 'subjects' => []];
+    }
+    if ($row['subj_id']) {
+        $coverage[$sa_id]['subjects'][$row['subj_id']] = $row['subj_name'];
+    }
+}
+$cov_stmt->close();
+
+// Determine if any subject is actually assigned to the member
+$has_any_subject = false;
+foreach ($coverage as $sa) {
+    if (!empty($sa['subjects'])) {
+        $has_any_subject = true;
+        break;
+    }
+}
+
+// - All department subject areas with their subjects (for the coverage editor) -
+$dept_subject_areas = [];
+$dsa_stmt = $conn->prepare("SELECT id, name FROM subject_area WHERE department_id = ? ORDER BY name");
+$dsa_stmt->bind_param('i', $department_id);
+$dsa_stmt->execute();
+$dsa_res = $dsa_stmt->get_result();
+while ($dsa = $dsa_res->fetch_assoc()) {
+    $sub_list = [];
+    $dsub_stmt = $conn->prepare("SELECT id, name FROM subjects WHERE subject_area_id = ? ORDER BY name");
+    $dsub_stmt->bind_param('i', $dsa['id']);
+    $dsub_stmt->execute();
+    $dsub_res = $dsub_stmt->get_result();
+    while ($sub = $dsub_res->fetch_assoc()) $sub_list[] = $sub;
+    $dsub_stmt->close();
+    $dsa['subjects'] = $sub_list;
+    $dept_subject_areas[] = $dsa;
+}
+$dsa_stmt->close();
+
+// - Member's currently assigned subject area / subject IDs (for the coverage editor) -
+$assigned_sa_ids = [];
+$asa_stmt = $conn->prepare("
+    SELECT jfsa.subject_area_id
+    FROM junction_faculty_subjectarea jfsa
+    WHERE jfsa.faculty_id = ?
+      AND jfsa.subject_area_id IN (SELECT id FROM subject_area WHERE department_id = ?)
+");
+$asa_stmt->bind_param('ii', $member_id, $department_id);
+$asa_stmt->execute();
+$asa_res = $asa_stmt->get_result();
+while ($row = $asa_res->fetch_assoc()) $assigned_sa_ids[] = (int)$row['subject_area_id'];
+$asa_stmt->close();
+
+$assigned_subject_ids = [];
+$asub_stmt = $conn->prepare("
+    SELECT DISTINCT jfs.subject_id
+    FROM junction_faculty_subject jfs
+    JOIN subjects s ON s.id = jfs.subject_id
+    WHERE jfs.faculty_id = ?
+      AND s.subject_area_id IN (SELECT id FROM subject_area WHERE department_id = ?)
+");
+$asub_stmt->bind_param('ii', $member_id, $department_id);
+$asub_stmt->execute();
+$asub_res = $asub_stmt->get_result();
+while ($row = $asub_res->fetch_assoc()) $assigned_subject_ids[] = (int)$row['subject_id'];
+$asub_stmt->close();
+
+// - Head's full name -
+$head_name = '';
+$hstmt = $conn->prepare("SELECT CONCAT(first_name, ' ', last_name) AS full_name FROM faculty WHERE id = ?");
+$hstmt->bind_param('i', $faculty_id);
+$hstmt->execute();
+$hstmt->bind_result($head_name);
+$hstmt->fetch();
+$hstmt->close();
+
+// - Department name -
+$dept_name = '';
+$dstmt = $conn->prepare("SELECT name FROM departments WHERE id = ?");
+$dstmt->bind_param('i', $department_id);
+$dstmt->execute();
+$dstmt->bind_result($dept_name);
+$dstmt->fetch();
+$dstmt->close();
+
+// - Last edited timestamp and who edited it -
+$last_edited = null;
+$edited_by_name = '';
+$lestmt = $conn->prepare("
+    SELECT COALESCE(s.updated_at, s.created_at) AS last_time,
+           CONCAT(f.first_name, ' ', f.last_name) AS editor_name
+    FROM schedules s
+    LEFT JOIN faculty f ON f.id = COALESCE(s.updated_by, s.created_by)
+    WHERE s.faculty_id = ?
+    ORDER BY COALESCE(s.updated_at, s.created_at) DESC
+    LIMIT 1
+");
+$lestmt->bind_param('i', $member_id);
+$lestmt->execute();
+$le_res = $lestmt->get_result();
+if ($le_row = $le_res->fetch_assoc()) {
+    $last_edited = $le_row['last_time'];
+    $edited_by_name = ' by ' . ($le_row['editor_name'] ?? '');
+}
+$lestmt->close();
+
+// - Ordinal helper -
+function ordinal($number)
+{
+    $ends = ['th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th'];
+    if (($number % 100) >= 11 && ($number % 100) <= 13) return $number . 'th';
+    return $number . $ends[$number % 10];
+}
+
+// - Date map for each day of the week -
+$dow_map = ['Sunday' => 0, 'Monday' => 1, 'Tuesday' => 2, 'Wednesday' => 3, 'Thursday' => 4, 'Friday' => 5, 'Saturday' => 6];
+$today_dow_num = $dow_map[$today];
+$day_date_map = [];
+$day_date_full = [];
+foreach ($days as $day) {
+    $diff = $dow_map[$day] - $today_dow_num;
+    $dt = new DateTime("$diff days");
+    $day_date_map[$day] = strtoupper($dt->format('M j'));
+    $day_date_full[$day] = $dt->format('F j');
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!--External links-->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+
+    <!--Relative links-->
+    <link rel="icon" type="image/png" href="../../images/icon.png">
+    <link rel="stylesheet" href="../../css/base/global.css">
+    <link rel="stylesheet" href="../../css/base/containers.css">
+    <link rel="stylesheet" href="../../css/base/tooltip.css">
+    <link rel="stylesheet" href="../../css/base/modals.css">
+    <link rel="stylesheet" href="../../css/faculty/timetable.css">
+    <link rel="stylesheet" href="../../css/faculty/common.css">
+    <link rel="stylesheet" href="../../css/faculty/settings.css">
+    <link rel="stylesheet" href="../../css/faculty/head-timetable.css">
+
+    <title><?= htmlspecialchars($member_name) ?> - Schedule - LumineSense</title>
+</head>
+
+<body class="contrast-bg">
+    <div class="parent-container">
+
+        <?php include __DIR__ . "/../../src/Includes/faculty-topbar.php"; ?>
+
+        <div class="child-container mb-3">
+
+            <div class="main-container faculty-timetable-heading d-flex flex-column align-items-center justify-content-center w-auto mb-2" style="position:relative; background-color: var(--secondary-color-2);">
+                <div class="d-flex gap-2" style="position:absolute;left:8px;top:50%;transform:translateY(-50%);">
+                    <button type="button" class="timetable-btn" onclick="dissolve('faculty-head-timetable.php')" title="Back to Department">
+                        <i class="bi bi-arrow-left"></i>
+                        <span class="timetable-btn-title bold">Back</span>
+                    </button>
+                    <button type="button" class="timetable-btn" data-bs-toggle="modal" data-bs-target="#editScheduleModal" onclick="openAddScheduleModal()" title="Add Schedule Slot">
+                        <i class="bi bi-plus-lg"></i>
+                        <span class="timetable-btn-title bold">Add Slot</span>
+                    </button>
+                </div>
+                <div class="d-flex gap-2" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);">
+                    <button type="button" class="timetable-btn" data-panel="panelCoverage" title="Coverage Details">
+                        <span class="timetable-btn-title bold">Coverage</span>
+                        <i class="bi bi-layout-three-columns"></i>
+                    </button>
+                    <button type="button" class="timetable-btn" data-panel="panelInfo" title="Schedule Info">
+                        <span class="timetable-btn-title bold">Info</span>
+                        <i class="bi bi-info-circle"></i>
+                    </button>
+                </div>
+                <div class="p-2" style="color: #fff; background-color: var(--secondary-color-1); border-radius: 5px;">
+                    <h2 class="bold"><?= htmlspecialchars($member_name) ?>'s Schedule </h2>
+                    <p class="text-uppercase text-center mb-0 " style="font-size: 14px; color: var(--muted-white); ">
+                        Effective A.Y. <strong><?= date('Y') ?>-<?= date('Y', strtotime('+1 year')) ?></strong>
+                    </p>
+                </div>
+
+                <!-- Coverage panel -->
+                <div id="panelCoverage" class="timetable-panel panel-from-right p-3 m-3">
+                    <div style="background-color: #f8f9fa;" class="section-container timetable mb-3">
+                        <div class="section-topbar mx-2 justify-content-between">
+                            <div>
+                                <h2 class="bold"><i class="bi bi-layout-three-columns me-1"></i>Assigned Coverage</h2>
+                            </div>
+                            <button type="button" class="btn-icon btn-icon-edit" onclick="openEditCoverageModal()" title="Edit Coverage" data-bs-toggle="tooltip" data-bs-placement="left">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                        </div>
+                        <div class="d-flex flex-column p-2 gap-2" style="max-height:25vh;overflow-y:auto;">
+                            <?php if (!empty($coverage)): ?>
+                                <?php foreach ($coverage as $sa): ?>
+                                    <div class="dept-info-card mb-0 coverage-item">
+                                        <div class="coverage-head d-flex align-items-center justify-content-between">
+                                            <div class="d-flex align-items-center gap-2">
+                                                <i class="bi bi-briefcase coverage-icon"></i>
+                                                <span class="coverage-area-name bold"><?= htmlspecialchars($sa['name']) ?></span>
+                                            </div>
+                                            <span class="coverage-count"><?= count($sa['subjects']) ?> subject<?= count($sa['subjects']) === 1 ? '' : 's' ?></span>
+                                        </div>
+                                        <?php if (!empty($sa['subjects'])): ?>
+                                            <div class="d-flex flex-wrap gap-1 mt-2">
+                                                <?php foreach ($sa['subjects'] as $subj_name): ?>
+                                                    <span class="subarea-subject bold"><?= htmlspecialchars($subj_name) ?></span>
+                                                <?php endforeach; ?>
+                                            </div>
+                                        <?php else: ?>
+                                            <div class="small text-muted mt-2">No subjects under this area.</div>
+                                        <?php endif; ?>
+                                    </div>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <span class="text-muted">No subject areas assigned.</span>
+                            <?php endif; ?>
+                            <?php if (!$has_any_subject): ?>
+                                <p class="small mb-2 mt-1">
+                                    <strong>Attention:</strong> Currently, <?= htmlspecialchars($member_name) ?> <strong>doesn't have any subjects assigned for teaching</strong>.
+                                    Please assign subjects to this faculty member <strong>in the previous page</strong> to ensure they have the necessary teaching responsibilities.
+                                </p>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Info panel -->
+                <div id="panelInfo" class="timetable-panel panel-from-right p-3 m-3">
+                    <div style="background-color: #f8f9fa;" class="section-container timetable mb-3">
+                        <div class="section-topbar mx-2 justify-content-between">
+                            <div>
+                                <h2 class="bold"><i class="bi bi-info-circle me-1"></i>Schedule Info</h2>
+                            </div>
+                        </div>
+                        <div class="dept-info-card mb-0 info-panel">
+                            <div class="info-row">
+                                <span class="info-label">Prepared by</span>
+                                <span class="info-value"><span class="status-badge faculty-head bold">Faculty Head</span> <strong><?= htmlspecialchars($head_name) ?></strong></span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Last Edited</span>
+                                <span class="info-value"><strong><?= $last_edited ? date('F j, Y (g:i A)', strtotime($last_edited)) : 'No schedules yet' ?></strong><?php if ($edited_by_name): ?> <span class="text-muted"><?= htmlspecialchars($edited_by_name) ?></span><?php endif; ?></span>
+                            </div>
+                            <div class="info-row">
+                                <span class="info-label">Current Department</span>
+                                <span class="info-value"><strong><?= htmlspecialchars($dept_name) ?></strong></span>
+                            </div>
+                            <div class="info-note">
+                                <strong>Note:</strong> As a <span class="status-badge faculty-head bold">Faculty Head</span> of this department, you can manage the schedule of this faculty member.
+                                You can add, edit, or delete schedule slots as needed while abiding by the department's policies and guidelines.
+                                Please ensure that any changes made are communicated to the faculty member and relevant parties.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Weekly Calendar Type -->
+            <div class="main-container homepage gap-3 mt-2" style="flex-direction:column;">
+                <div class="weekly-schedule-grid">
+                    <?php foreach ($days as $day):
+                        $is_today = ($day === $today);
+                        $slots    = $schedule_by_day[$day];
+                    ?>
+                        <div class="day-card <?= $is_today ? 'today' : '' ?>">
+                            <div class="day-label">
+                                <div class="text-uppercase small fw-bold mb-1" style="font-size:11px;letter-spacing:0.5px;color:<?= $is_today ? '#fff' : '#6c757d' ?>;"><?= $day_date_map[$day] ?? '' ?></div>
+                                <?= $day ?> <?= $is_today ? '· Today' : '' ?>
+                            </div>
+
+                            <?php if (empty($slots)): ?>
+                                <p class="no-sched">No classes scheduled.</p>
+                                <?php else: foreach ($slots as $slot):
+                                    $now_time  = date('H:i:s');
+                                    $is_running = ($slot['day_of_week'] === $today && $now_time >= $slot['start_time'] && $now_time <= $slot['end_time']);
+                                    $start    = date('g:i A', strtotime($slot['start_time']));
+                                    $end      = date('g:i A', strtotime($slot['end_time']));
+                                    $subject_label = !empty($slot['subject_name'])
+                                        ? trim($slot['subject_name'])
+                                        : 'None assigned';
+                                    $is_owner = (int)$slot['created_by'] === $faculty_id;
+                                    $creator_name = trim(($slot['creator_first'] ?? '') . ' ' . ($slot['creator_last'] ?? ''));
+                                ?>
+                                    <div class="slot-row">
+                                        <div class="slot-time">
+                                            <?php
+                                            $start_parts = explode(' ', $start);
+                                            $start_time_part = $start_parts[0];
+                                            $start_ampm = $start_parts[1] ?? 'AM';
+                                            $end_parts = explode(' ', $end);
+                                            $end_time_part = $end_parts[0];
+                                            $end_ampm = $end_parts[1] ?? 'AM';
+                                            ?>
+                                            <span class="slot-time-start"><?= $start_time_part ?></span>
+                                            <span class="slot-time-separator">TO</span>
+                                            <span class="slot-time-end"><?= $end_time_part ?></span>
+                                            <span class="slot-time-ampm"><?= $end_ampm ?></span>
+                                        </div>
+                                        <div class="slot-content">
+                                            <div class="slot-room">
+                                                <i class="bi bi-door-open me-1"></i><?= htmlspecialchars($slot['room_name']) ?>
+                                            </div>
+                                            <div class="slot-subject d-flex flex-row">
+                                                <i class="bi bi-book me-1"></i>
+                                                <h5><?= htmlspecialchars($subject_label) ?></h5>
+                                            </div>
+                                        </div>
+                                        <div class="slot-actions">
+                                            <button class="btn-icon <?= $is_owner ? ($is_running ? 'btn-icon-disabled' : 'btn-icon-edit') : 'btn-icon-disabled' ?>"
+                                                title="<?= $is_owner
+                                                            ? ($is_running ? 'Cannot Edit - Schedule Currently Running' : 'Edit Schedule Details')
+                                                            : 'Restricted - assigned by another faculty head'
+                                                        ?>"
+                                                onclick="<?= $is_owner
+                                                                ? ($is_running
+                                                                    ? "showRunningWarningModal()"
+                                                                    : "openEditScheduleModal(" . (int)$slot['id'] . ",'" . $slot['day_of_week'] . "','" . substr($slot['start_time'], 0, 5) . "','" . substr($slot['end_time'], 0, 5) . "'," . (int)$slot['classroom_id'] . "," . (int)($slot['subject_id'] ?? 0) . ",'" . htmlspecialchars($subject_label, ENT_QUOTES) . "')"
+                                                                  )
+                                                                : "showRestrictedModal('" . htmlspecialchars($creator_name, ENT_QUOTES) . "')"
+                                                            ?>"
+                                                data-bs-toggle="tooltip"
+                                                data-bs-placement="auto">
+                                                <i class="bi bi-pencil"></i>
+                                            </button>
+                                            <button class="btn-icon btn-icon-view"
+                                                title="View Details"
+                                                data-bs-toggle="tooltip"
+                                                data-bs-placement="auto"
+                                                onclick="openSlotDetails(
+                                                '<?= htmlspecialchars($slot['day_of_week'], ENT_QUOTES) ?>',
+                                                '<?= $start ?>',
+                                                '<?= $end ?>',
+                                                '<?= htmlspecialchars($slot['room_name'], ENT_QUOTES) ?>',
+                                                '<?= htmlspecialchars($subject_label, ENT_QUOTES) ?>'
+                                            )">
+                                                <i class="bi bi-eye"></i>
+                                            </button>
+                                            <?php if (!empty($slot['ext_status'])): ?>
+                                                <?php if ($slot['ext_status'] === 'pending'): ?>
+                                                    <span class="badge-ext-pending" title="Extension pending" data-bs-toggle="tooltip"><i class="bi bi-hourglass-bottom"></i></span>
+                                                <?php elseif ($slot['ext_status'] === 'approved'): ?>
+                                                    <span class="badge-ext-approved" title="Extension approved" data-bs-toggle="tooltip"><i class="bi bi-check-circle"></i></span>
+                                                <?php elseif ($slot['ext_status'] === 'rejected'): ?>
+                                                    <span class="badge-ext-rejected" title="Extension rejected" data-bs-toggle="tooltip"><i class="bi bi-x-circle"></i></span>
+                                                <?php endif; ?>
+                                            <?php endif; ?>
+                                            <button class="btn-icon <?= $is_owner ? 'btn-icon-del' : 'btn-icon-disabled' ?>"
+                                                title="<?= $is_owner ? 'Delete Schedule' : 'Restricted - assigned by another faculty head' ?>"
+                                                onclick="<?= $is_owner
+                                                                ? "confirmDeleteSchedule(" . (int)$slot['id'] . ")"
+                                                                : "showRestrictedModal('" . htmlspecialchars($creator_name, ENT_QUOTES) . "')"
+                                                            ?>"
+                                                data-bs-toggle="tooltip"
+                                                data-bs-placement="auto">
+                                                <i class="bi bi-trash"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                            <?php endforeach;
+                            endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+        </div>
+
+        <?php include __DIR__ . "/../../src/Includes/faculty-sidebar.php"; ?>
+
+        <script src="../../js/lib/animations.js"></script>
+        <script src="../../js/lib/toggles.js"></script>
+        <script src="../../js/lib/tooltip.js"></script>
+    </div>
+
+    <!-- Edit Schedule Modal -->
+    <div class="profile-details-modal modal fade" id="editScheduleModal" tabindex="-1" aria-labelledby="editScheduleLabel" aria-hidden="true">
+        <div class="d-flex justify-content-center modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title bold" id="editScheduleLabel">
+                        <i class="bi bi-pencil me-2"></i>Edit Schedule Details
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="edit-slot-id" value="">
+                    <input type="hidden" id="edit-is-add" value="">
+                    <div class="mb-3">
+                        <label class="form-label bold">Day of Week</label>
+                        <select class="form-select" id="edit-day">
+                            <?php foreach ($days as $d):
+                                $day_date_label = $day_date_full[$d] ?? '';
+                            ?>
+                                <option value="<?= $d ?>" <?= $d === $today ? 'selected' : '' ?>><?= $d ?> (<?= $day_date_label ?>)</option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col-6">
+                            <label class="form-label bold">Start Time</label>
+                            <input type="time" class="form-control" id="edit-start">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label bold">End Time</label>
+                            <input type="time" class="form-control" id="edit-end">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label bold">Room</label>
+                        <select class="form-select" id="edit-room">
+                            <?php foreach ($rooms as $rm): ?>
+                                <option value="<?= (int)$rm['id'] ?>"><?= htmlspecialchars($rm['room_name']) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label bold">Subject</label>
+                        <input type="text" class="form-control mb-2" id="edit-subject-search" placeholder="Search subjects..." autocomplete="off">
+                        <div class="mb-1" style="font-size:13px;color:var(--text-muted);">Selected: <span id="edit-selected-subject-name" class="text-muted" style="font-style:italic;">None</span></div>
+                        <div class="d-flex flex-wrap gap-1" id="edit-available-subjects-container">
+                            <?php foreach ($subjects as $sub): ?>
+                                <span class="subarea-subject bold dept-emphases align-items-center justify-content-center px-3 edit-subject-item"
+                                    data-subject-id="<?= (int)$sub['id'] ?>"
+                                    data-subject-name="<?= htmlspecialchars(trim($sub['name']), ENT_QUOTES) ?>"
+                                    title="Click to select this subject"
+                                    style="cursor:pointer;">
+                                    <?= htmlspecialchars(trim($sub['name'])) ?>
+                                    <button type="button" class="p-0 ms-1 d-inline-flex flex-shrink-0 align-items-center text-white border-0 bg-transparent" title="Select Subject">
+                                        <i class="bi bi-plus-circle"></i>
+                                    </button>
+                                </span>
+                            <?php endforeach; ?>
+                            <?php if (empty($subjects)): ?>
+                                <p class="text-muted small mb-0">No subjects assigned.</p>
+                            <?php endif; ?>
+                        </div>
+                        <input type="hidden" id="edit-subject-id" value="0">
+                        <input type="hidden" id="edit-subject-name" value="">
+                    </div>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="light w-100 px-3" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="medium w-100 px-3" onclick="saveSchedule()">
+                        <i class="bi bi-check-lg me-1"></i>Save
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirm Modal -->
+    <div class="modal fade" id="deleteScheduleModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#c0004e,#e05580);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Delete Schedule Slot</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-trash" style="font-size:2.5rem;color:#c0004e;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;">
+                        Are you sure you want to delete this schedule slot?
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button class="light" data-bs-dismiss="modal">Cancel</button>
+                    <button class="medium" style="background:#c0004e;" onclick="executeDeleteSchedule()">
+                        <i class="bi bi-trash me-1"></i> Delete
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Save Schedule Modal (stacked on top of edit modal) -->
+    <div class="modal fade" id="confirmSaveScheduleModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#2a7a3e,#5cb85c);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Confirm Schedule</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-question-circle" style="font-size:2.5rem;color:#2a7a3e;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;" id="confirm-save-message">
+                        Are you sure you want to save this schedule slot?
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button class="light" data-bs-dismiss="modal">Cancel</button>
+                    <button class="medium" style="background:#2a7a3e;" id="confirm-save-btn">
+                        <i class="bi bi-check-lg me-1"></i> Confirm
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Overlap Warning Modal -->
+    <div class="modal fade" id="overlapWarningModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#c0392b,#e74c3c);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Schedule Overlap</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-exclamation-octagon" style="font-size:2.5rem;color:#c0392b;"></i>
+                    <p class="mt-3 mb-2" style="font-size:15px;font-weight:600;">This slot overlaps with an existing schedule:</p>
+                    <div id="overlap-details" class="text-start d-inline-block" style="font-size:14px;"></div>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="medium w-100 px-3" style="background:#c0392b;" data-bs-dismiss="modal">Understood</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Time Validation Caution Modal -->
+    <div class="modal fade" id="timeValidationModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#e67e22,#f39c12);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Caution</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-exclamation-triangle" style="font-size:2.5rem;color:#e67e22;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;">
+                        End time must be after start time. Please check your schedule entry - a time like 9PM to 10AM is not valid because the end falls before the start on the same day.
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="medium w-100 px-3" data-bs-dismiss="modal">Understood</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restricted Action Modal -->
+    <div class="modal fade" id="restrictedActionModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#8e44ad,#bb6bd9);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Action Restricted</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-shield-exclamation" style="font-size:2.5rem;color:#8e44ad;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;">
+                        This schedule slot was assigned by<br>
+                        <strong id="restricted-creator-name">another Faculty Head</strong>.<br><br>
+                        You cannot edit or delete a slot created by a different Faculty Head.
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="medium w-100 px-3" style="background:#8e44ad;" data-bs-dismiss="modal">Understood</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Running Schedule Warning Modal -->
+    <div class="modal fade" id="runningScheduleModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#e67e22,#f39c12);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Cannot Edit</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-clock-history" style="font-size:2.5rem;color:#e67e22;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;">
+                        This schedule slot is currently running and cannot be edited.<br><br>
+                        Please wait until the class session ends before making changes.
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="medium w-100 px-3" style="background:#e67e22;" data-bs-dismiss="modal">Understood</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Slot Details Modal -->
+    <div class="profile-details-modal modal fade" id="viewSlotModal" tabindex="-1" aria-labelledby="viewSlotLabel" aria-hidden="true">
+        <div class="d-flex justify-content-center modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title bold" id="viewSlotLabel">
+                        <i class="bi bi-calendar-event me-2"></i>Schedule Details
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="d-flex flex-column gap-3">
+                        <div class="d-flex align-items-center gap-3 p-3 bg-light rounded-3">
+                            <i class="bi bi-calendar-week" style="font-size:1.6rem; flex-shrink:0; color:var(--secondary-color-4);"></i>
+                            <div class="flex-grow-1">
+                                <div class="text-muted">Day</div>
+                                <strong id="slot-day"></strong>
+                            </div>
+                        </div>
+                        <div class="d-flex align-items-center gap-3 p-3 bg-light rounded-3">
+                            <i class="bi bi-clock" style="font-size:1.6rem; flex-shrink:0; color:var(--secondary-color-4);"></i>
+                            <div class="flex-grow-1">
+                                <div class="text-muted">Time</div>
+                                <strong id="slot-time"></strong>
+                            </div>
+                        </div>
+                        <div class="d-flex align-items-center gap-3 p-3 bg-light rounded-3">
+                            <i class="bi bi-door-open" style="font-size:1.6rem; flex-shrink:0; color:var(--secondary-color-4);"></i>
+                            <div class="flex-grow-1">
+                                <div class="text-muted">Room</div>
+                                <strong id="slot-room"></strong>
+                            </div>
+                        </div>
+                        <div class="d-flex align-items-center gap-3 p-3 bg-light rounded-3">
+                            <i class="bi bi-book" style="font-size:1.6rem; flex-shrink:0; color:var(--secondary-color-4);"></i>
+                            <div class="flex-grow-1">
+                                <div class="text-muted">Subject</div>
+                                <strong id="slot-subject"></strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="light" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Coverage Modal (two panes: Subject Areas | Subjects) -->
+    <div class="profile-details-modal modal fade" id="editCoverageModal" tabindex="-1" aria-labelledby="editCoverageLabel" aria-hidden="true">
+        <div class="d-flex justify-content-center modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title bold" id="editCoverageLabel">
+                        <i class="bi bi-briefcase me-2"></i>Edit Coverage for <span id="editCoverageMemberName"></span>
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Left / right pane navigation -->
+                    <div class="coverage-wizard-nav d-flex align-items-center justify-content-between mb-3">
+                        <button type="button" class="btn-icon btn-icon-edit coverage-nav-btn" id="coverageNavPrev" title="Previous: Subject Areas" onclick="coverageNav(-1)">
+                            <i class="bi bi-chevron-left"></i>
+                        </button>
+                        <div class="coverage-wizard-steps d-flex align-items-center justify-content-center gap-2">
+                            <span class="coverage-step active" data-step="0"><i class="bi bi-briefcase me-1"></i>Subject Areas</span>
+                            <i class="bi bi-arrow-right text-muted"></i>
+                            <span class="coverage-step" data-step="1"><i class="bi bi-book me-1"></i>Subjects</span>
+                        </div>
+                        <button type="button" class="btn-icon btn-icon-edit coverage-nav-btn" id="coverageNavNext" title="Next: Subjects" onclick="coverageNav(1)">
+                            <i class="bi bi-chevron-right"></i>
+                        </button>
+                    </div>
+
+                    <!-- Pane 0: Subject Areas -->
+                    <div class="coverage-pane" id="coveragePaneAreas">
+                        <div class="dept-info-card mb-3">
+                            <label class="form-label bold"><i class="bi bi-briefcase me-2"></i>Current Subject Area/s:</label>
+                            <div id="coverageAssignedSAs" class="d-flex flex-wrap gap-1"></div>
+                        </div>
+                        <div class="dept-info-card mb-0">
+                            <label class="form-label bold"><i class="bi bi-search me-1"></i>Search Subject Areas:</label>
+                            <input type="text" class="form-control mb-2" id="coverageSaSearch" placeholder="Search available subject areas...">
+                            <label class="form-label bold" style="font-size:13px;">Available Subject Areas:</label>
+                            <div id="coverageAvailableSAs" class="d-flex flex-wrap gap-1"></div>
+                        </div>
+                    </div>
+
+                    <!-- Pane 1: Subjects -->
+                    <div class="coverage-pane d-none" id="coveragePaneSubjects">
+                        <div class="dept-info-card mb-3">
+                            <label class="form-label bold"><i class="bi bi-collection me-2"></i>Available Subject Areas:</label>
+                            <select class="form-select" id="coverageSaSelect">
+                                <option value="">Select a subject area...</option>
+                            </select>
+                        </div>
+                        <div class="dept-info-card mb-3">
+                            <label class="form-label bold"><i class="bi bi-search me-1"></i>Search Subjects:</label>
+                            <input type="text" class="form-control mb-2" id="coverageSubjectSearch" placeholder="Select a subject area first" disabled>
+                            <label class="form-label bold" style="font-size:13px;">Available Subjects:</label>
+                            <div id="coverageAvailableSubjects" class="d-flex flex-wrap gap-1"></div>
+                        </div>
+                        <div class="dept-info-card mb-0">
+                            <label class="form-label bold"><i class="bi bi-book me-2"></i>Currently Assigned Subjects:</label>
+                            <div id="coverageAssignedSubjects" class="d-flex flex-wrap gap-1"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button type="button" class="light" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="medium" onclick="confirmCoverageSave()">
+                        <i class="bi bi-check-lg me-1"></i>Save Changes
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Save Coverage Modal -->
+    <div class="modal fade" id="confirmCoverageModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content">
+                <div class="modal-header" style="background:linear-gradient(135deg,#2a7a3e,#5cb85c);color:#fff;">
+                    <h5 class="modal-title" style="font-weight:700;">Confirm Coverage</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body text-center p-4">
+                    <i class="bi bi-question-circle" style="font-size:2.5rem;color:#2a7a3e;"></i>
+                    <p class="mt-3 mb-0" style="font-size:15px;">
+                        Save these coverage changes for <strong id="confirmCoverageName"></strong>?
+                    </p>
+                </div>
+                <div class="modal-footer d-flex flex-nowrap flex-row justify-content-between gap-2">
+                    <button class="light" data-bs-dismiss="modal">Cancel</button>
+                    <button class="medium" style="background:#2a7a3e;" onclick="executeCoverageSave()">
+                        <i class="bi bi-check-lg me-1"></i> Confirm
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        window.lumiMemberschedSubjects = <?= json_encode($subjects) ?>;
+        window.lumiMemberschedRooms = <?= json_encode($rooms) ?>;
+        window.lumiMemberschedMemberId = <?= (int)$member_id ?>;
+        window.lumiMemberschedToday = '<?= $today ?>';
+        window.lumiMemberschedDeptId = <?= (int)$department_id ?>;
+        window.lumiMemberschedMemberName = <?= json_encode($member_name) ?>;
+        window.lumiMemberschedDeptSAs = <?= json_encode($dept_subject_areas) ?>;
+        window.lumiMemberschedAssignedSAs = <?= json_encode($assigned_sa_ids) ?>;
+        window.lumiMemberschedAssignedSubjects = <?= json_encode($assigned_subject_ids) ?>;
+    </script>
+
+    <script src="../../js/faculty/faculty-head-membersched.js"></script>
+    <script src="../../js/faculty/faculty-tutorial.js"></script>
+</body>
+
+</html>
